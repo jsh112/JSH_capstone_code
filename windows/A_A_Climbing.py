@@ -22,10 +22,13 @@ from A_servo_utils import send_servo_angles, yaw_pitch_from_X
 from A_color_select import choose_color
 
 # 테스트
-# from test import list_cameras
+from test import list_cameras
+
+# config
+from config import *
 
 # ========= 사용자 환경 경로 =========
-NPZ_PATH       = r"./param/stereo_params_scaled_1012.npz"
+NPZ_PATH       = r"./param/stereo_params_1024_576.npz"
 MODEL_PATH     = r"./param/best_6.pt"
 
 CAM1_INDEX     = 2   # 왼쪽 카메라
@@ -112,7 +115,7 @@ except Exception:
 
 def rotate_point(pt, shape_hw, rot_code):
     """(x,y) 픽셀을 주어진 회전 코드로 변환. shape_hw는 '회전 전'의 (H,W)."""
-    if pt is None or rot_code is None: 
+    if pt is None or rot_code is None:
         return pt
     h, w = shape_hw
     x, y = int(pt[0]), int(pt[1])
@@ -241,11 +244,12 @@ def _load_stereo_and_log():
     print("[Info] (RAW) using P1=K1[I|0], P2=K2[R|T]")
     return K1, D1, K2, D2, R, T, P1, P2
 
-def _capture_laser_raw(args):
+def _capture_laser_raw(args,ctl=None):
     try:
         laser_raw = capture_once_and_return(
             port=args.port, baud=args.baud,
-            center_pitch=90.0, center_yaw=90.0, servo_settle_s=0.5
+            center_pitch=90.0, center_yaw=90.0, servo_settle_s=0.5,
+            ctl=ctl
         )
     except Exception as e:
         print(f"[A_Climbing] find_laser error: {e} → continue without laser")
@@ -833,10 +837,14 @@ def _run_frame_loop(cap1, cap2, size,
 # ---------- 메인 ----------
 def main():
     args = _parse_args()
+    # ===== 10/14 -> JSH, 레이저가 켜지지 않고 꺼지는 오류 수정용 =====
+    ctl = DualServoController(args.port, args.baud)
+    # ===== 10/14 -> JSH, 레이저가 켜지지 않고 꺼지는 오류 수정용 =====
 
-    # 1014 test
+    # ===== 10/14 -> JSH, 카메라가 잘 잡히지 않아서 debug용 print =====
     cams = list_cameras()
     print(f"\n총 {len(cams)}개의 카메라가 감지되었습니다.")
+    # ===== 10/14 -> JSH, 카메라가 잘 잡히지 않아서 debug용 print =====
 
     # 경로 검증
     _verify_paths()
@@ -845,7 +853,7 @@ def main():
     K1, D1, K2, D2, R, T, P1, P2 = _load_stereo_and_log()
 
     # 레이저 좌표 먼저 측정 (find_laser) → 보정좌표로 변환
-    laser_px = _capture_laser_raw(args)
+    laser_px = _capture_laser_raw(args, ctl=ctl)
 
     L, O = compute_laser_origin_mid(T)
 

@@ -2,7 +2,7 @@ import cv2, numpy as np, platform
 
 # ========= 설정 =========
 CAM0, CAM1 = 2, 3          # 카메라 인덱스
-W, H = 1280, 720        # 해상도
+W, H = 1024, 576       # 해상도
 USE_ECC_ALIGN = True       # 전/후 미세 흔들림(translation) 정합
 BLUR = 0                   # 1픽셀 유지면 0, 약간 번지면 3
 BORDER_IGNORE = 2          # 프레임 테두리 n픽셀 무시
@@ -201,7 +201,9 @@ def draw_point(frame, pt):
 #         "cam1": (int(pt1[0]), int(pt1[1])) if pt1 is not None else None,
 #     }
 def capture_once_and_return(port="COM15", baud=115200,
-                            center_pitch=90.0, center_yaw=90.0, servo_settle_s=0.5):
+                            center_pitch=90.0, center_yaw=90.0,
+                            servo_settle_s=0.5,
+                            ctl=None):
     from servo_control import DualServoController
     import time, cv2
 
@@ -223,11 +225,7 @@ def capture_once_and_return(port="COM15", baud=115200,
     # ✅ FOURCC 확인
     print(f"[DEBUG] cam0 FOURCC:", cap0.get(cv2.CAP_PROP_FOURCC))
     print(f"[DEBUG] cam1 FOURCC:", cap1.get(cv2.CAP_PROP_FOURCC))
-    # ====== 해상도 테스트 ==========================
-
-    print(f"[DEBUG] 시리얼 연결 시도: {port}, {baud}bps")
-    ctl = DualServoController(port, baud)
-    print("[DEBUG] 서보 컨트롤러 초기화 완료")
+    # ====== 해상도 테스트 ==========================|
 
     print(f"[DEBUG] 서보 각도 초기화 중: pitch={center_pitch}, yaw={center_yaw}")
     ctl.set_angles(center_pitch, center_yaw)
@@ -241,6 +239,8 @@ def capture_once_and_return(port="COM15", baud=115200,
 
     cv2.namedWindow("cam0_preview", cv2.WINDOW_NORMAL)
     cv2.namedWindow("cam1_preview", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("cam0_preview", W, H)
+    cv2.resizeWindow("cam1_preview", W, H)
 
     def callback_left(event, x, y, flags, param):
         nonlocal pt0

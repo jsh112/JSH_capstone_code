@@ -296,6 +296,8 @@ def main():
         L_sets.append(holdsL_k); R_sets.append(holdsR_k)
         print(f"  - frame {k+1}/10: L={len(holdsL_k)}  R={len(holdsR_k)}")
 
+    # holdsL = assign_indices(merge_holds_by_center(L_sets, 18), ROW_TOL_Y)
+    # holdsR = assign_indices(merge_holds_by_center(R_sets, 18), ROW_TOL_Y)
     holdsL = assign_indices(merge_holds_by_center(L_sets, 18), ROW_TOL_Y)
     holdsR = assign_indices(merge_holds_by_center(R_sets, 18), ROW_TOL_Y)
     if not holdsL or not holdsR:

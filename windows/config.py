@@ -1,4 +1,5 @@
-NPZ_PATH       = r"./param/stereo_params_scaled_1012.npz"
+import cv2
+NPZ_PATH       = r"./param/stereo_params_1024_576_.npz"
 MODEL_PATH     = r"./param/best_6.pt"
 
 CAM1_INDEX     = 2   # 왼쪽 카메라
