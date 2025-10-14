@@ -22,10 +22,7 @@ from A_servo_utils import send_servo_angles, yaw_pitch_from_X
 from A_color_select import choose_color
 
 # 테스트
-from test import list_cameras
-
-# 클릭 관련 코드
-from click_events import mouse_callback
+# from test import list_cameras
 
 # ========= 사용자 환경 경로 =========
 NPZ_PATH       = r"./param/stereo_params_scaled_1012.npz"
