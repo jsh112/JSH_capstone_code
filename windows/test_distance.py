@@ -1,7 +1,7 @@
 from A_A_Climbing import triangulate_xy_raw, yaw_pitch_from_X, compute_laser_origin_mid
 import numpy as np, cv2
 
-S = np.load("stereo_params_scaled_1012.npz", allow_pickle=True)
+S = np.load("param/stereo_params_scaled_1012.npz", allow_pickle=True)
 K1, D1 = S["K1"], S["D1"]
 K2, D2 = S["K2"], S["D2"]
 R, T   = S["R"], S["T"].reshape(3,1)

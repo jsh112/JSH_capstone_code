@@ -31,4 +31,4 @@ def print_npz_calibration_info(npz_path):
     print("✅ 캘리브레이션 파일 로드 완료.\n")
 
 if __name__ == "__main__":
-    print_npz_calibration_info("./stereo_params_scaled_1012.npz")
+    print_npz_calibration_info("param/stereo_params_scaled_1012.npz")

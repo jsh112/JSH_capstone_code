@@ -34,8 +34,8 @@ except Exception:
         raise RuntimeError("A_web 모듈이 로드되지 않았습니다.")
 
 # ========= 사용자 환경 경로 =========
-NPZ_PATH       = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\stereo_params_scaled_1012.npz"
-MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\best_6.pt"
+NPZ_PATH       = r"./param/stereo_params_scaled_1012.npz"
+MODEL_PATH     = r"./param/best_6.pt"
 
 CAM1_INDEX     = 2   # 왼쪽 카메라
 CAM2_INDEX     = 3   # 오른쪽 카메라

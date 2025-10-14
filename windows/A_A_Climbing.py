@@ -28,8 +28,8 @@ from test import list_cameras
 from click_events import mouse_callback
 
 # ========= 사용자 환경 경로 =========
-NPZ_PATH       = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\stereo_params_scaled_1012.npz"
-MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\best_6.pt"
+NPZ_PATH       = r"./param/stereo_params_scaled_1012.npz"
+MODEL_PATH     = r"./param/best_6.pt"
 
 CAM1_INDEX     = 2   # 왼쪽 카메라
 CAM2_INDEX     = 3   # 오른쪽 카메라
@@ -48,7 +48,7 @@ ADV_COOLDOWN    = 0.5    # 연속 넘김 방지 쿨다운(sec)
 SAVE_VIDEO     = False
 OUT_FPS        = 30
 OUT_PATH       = "stereo_overlay.mp4"
-CSV_GRIPS_PATH = "./grip_records.csv"
+CSV_GRIPS_PATH = "route/grip_records.csv"
 
 # 런타임 보정 오프셋(레이저 실측)
 CAL_YAW_OFFSET   = 0.0
