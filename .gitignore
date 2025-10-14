@@ -1,0 +1,19 @@
+# PyCharm project files
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Python
+__pycache__/
+*.pyc
+.env/
+.venv/
+
+# Logs
+logs/
+*.log
+
+# OS stuff
+.DS_Store
+Thumbs.db
