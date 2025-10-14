@@ -1,8 +1,8 @@
 import cv2, numpy as np, platform
 
 # ========= 설정 =========
-CAM0, CAM1 = 2, 3          # 카메라 인덱스
-W, H = 1024, 576       # 해상도
+CAM0, CAM1 = 1, 2          # 카메라 인덱스
+W, H = 1280, 720        # 해상도
 USE_ECC_ALIGN = True       # 전/후 미세 흔들림(translation) 정합
 BLUR = 0                   # 1픽셀 유지면 0, 약간 번지면 3
 BORDER_IGNORE = 2          # 프레임 테두리 n픽셀 무시
@@ -17,8 +17,8 @@ POINT_EDGE_COLOR = (255, 255, 255) # 흰 테두리
 POINT_EDGE_THICK = 2
 
 ROTATE_MAP = {
-    2: cv2.ROTATE_90_COUNTERCLOCKWISE,  # LEFT
-    3: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
+    1: cv2.ROTATE_90_COUNTERCLOCKWISE,  # LEFT
+    2: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
 }
 # =======================
 
@@ -27,7 +27,7 @@ def rotate_image(img, rot_code):
 
 def rotate_point(pt, shape_hw, rot_code):
     """(x,y) 픽셀을 주어진 회전 코드로 변환. shape_hw는 '회전 전'의 (H,W)."""
-    if pt is None or rot_code is None:
+    if pt is None or rot_code is None: 
         return pt
     h, w = shape_hw
     x, y = int(pt[0]), int(pt[1])
@@ -116,194 +116,195 @@ def draw_point(frame, pt):
     cv2.circle(frame, pt, POINT_RADIUS + 2, POINT_EDGE_COLOR, POINT_EDGE_THICK, cv2.LINE_AA)
     return frame
 
-# def capture_once_and_return(port="COM15", baud=115200,
-#                             wait_s=2.0, settle_n=8, show_preview=True,
-#                             center_pitch=90.0, center_yaw=90.0, servo_settle_s=0.5):
-#     from servo_control import DualServoController
-#     import time, cv2
-#
-#     def _settle_and_grab(cap0, cap1, n=8):
-#         f0 = f1 = None
-#         for _ in range(max(1, int(n))):
-#             r0, f0 = cap0.read()
-#             r1, f1 = cap1.read()
-#             if not (r0 and r1):
-#                 raise RuntimeError("[find_laser] 카메라 프레임 획득 실패")
-#         return f0, f1
-#
-#     cap0, cap1 = open_cam(CAM0), open_cam(CAM1)
-#     if show_preview:
-#         cv2.namedWindow("cam0_preview", cv2.WINDOW_NORMAL)
-#         cv2.namedWindow("cam1_preview", cv2.WINDOW_NORMAL)
-#
-#     ctl = DualServoController(port, baud)
-#     try:
-#         # 0) 서보 중립(90/90) 세팅 → 안정화 대기
-#         try:
-#             # set_angles(pitch, yaw) 순서 주의
-#             ctl.set_angles(center_pitch, center_yaw)
-#         except Exception as e:
-#             print("[find_laser] center set_angles error:", e)
-#         time.sleep(max(0.0, float(servo_settle_s)))
-#
-#         # 1) 레이저 OFF → 대기 → BEFORE
-#         ctl.laser_off()
-#         time.sleep(max(0.0, float(wait_s)))
-#         before0, before1 = _settle_and_grab(cap0, cap1, settle_n)
-#         before0 = rotate_image(before0, ROTATE_MAP.get(CAM0))
-#         before1 = rotate_image(before1, ROTATE_MAP.get(CAM1))
-#         if show_preview:
-#             cv2.imshow("cam0_preview", before0)
-#             cv2.imshow("cam1_preview", before1)
-#             cv2.waitKey(1)
-#
-#         # 2) 레이저 ON → 대기 → AFTER
-#         ctl.laser_on()
-#         time.sleep(max(0.0, float(wait_s)))
-#         after0, after1 = _settle_and_grab(cap0, cap1, settle_n)
-#         after0 = rotate_image(after0, ROTATE_MAP.get(CAM0))
-#         after1 = rotate_image(after1, ROTATE_MAP.get(CAM1))
-#         if show_preview:
-#             cv2.imshow("cam0_preview", after0)
-#             cv2.imshow("cam1_preview", after1)
-#             cv2.waitKey(1)
-#
-#     finally:
-#         try: ctl.close()
-#         except: pass
-#
-#     # 3) 절대차 → 최대 변화점
-#     _, d0 = diff_maps(before0, after0)
-#     _, d1 = diff_maps(before1, after1)
-#     pt0 = max_change_pixel(d0, BORDER_IGNORE, REQUIRE_POSITIVE_DIFF)
-#     pt1 = max_change_pixel(d1, BORDER_IGNORE, REQUIRE_POSITIVE_DIFF)
-#
-#     if show_preview:
-#         d8_0 = cv2.normalize(d0, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-#         d8_1 = cv2.normalize(d1, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-#         over0, heat0 = overlay_heat(after0, d8_0)
-#         over1, heat1 = overlay_heat(after1, d8_1)
-#         over0 = draw_point(over0, pt0); over1 = draw_point(over1, pt1)
-#         if pt0 is not None: cv2.drawMarker(heat0, pt0, (0,255,0), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
-#         if pt1 is not None: cv2.drawMarker(heat1, pt1, (0,255,0), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
-#         cv2.imshow("cam0_preview", over0); cv2.imshow("cam1_preview", over1)
-#         cv2.imshow("diff0", heat0);        cv2.imshow("diff1", heat1)
-#         cv2.waitKey(1)
-#
-#     try:
-#         cap0.release(); cap1.release(); cv2.destroyAllWindows()
-#     except: pass
-#     H0, W0 = after0.shape[:2]
-#     H1, W1 = after1.shape[:2]
-#     return {
-#         "image_size": (W0, H0),  # cam0 회전 후 크기 (W,H)
-#         "cam0": (int(pt0[0]), int(pt0[1])) if pt0 is not None else None,
-#         "cam1": (int(pt1[0]), int(pt1[1])) if pt1 is not None else None,
-#     }
-def capture_once_and_return(port="COM15", baud=115200,
-                            center_pitch=90.0, center_yaw=90.0,
-                            servo_settle_s=0.5,
-                            frame_size=(1024, 576)
-                            ):
+def capture_once_and_return(
+    port="COM15", baud=115200,
+    wait_s=2.0, settle_n=8, show_preview=True,
+    center_pitch=90.0, center_yaw=90.0, servo_settle_s=0.5,
+    frame_size=None,          # ← (W, H) 튜플; 지정 시 해당 해상도로 캡쳐
+):
+    import time
     from servo_control import DualServoController
-    import time, cv2
 
-    pt0 = None
-    pt1 = None
-    f0r, fr1 = None, None
+    # --- 로컬 카메라 오픈(전역 W/H에 의존하지 않음) ---
+    def open_cam_with_size(idx, size=None):
+        be = 0
+        import platform
+        if platform.system() == "Windows": be = cv2.CAP_DSHOW
+        elif platform.system() == "Linux": be = cv2.CAP_V4L2
+        cap = cv2.VideoCapture(idx, be)
+        if size:
+            W, H = size
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  int(W))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(H))
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        return cap
 
-    cap0, cap1= open_cam(CAM0), open_cam(CAM1)
-    # ====== 해상도 테스트 ==========================
-    # ✅ 실제 적용된 해상도 확인
-    real_w0 = cap0.get(cv2.CAP_PROP_FRAME_WIDTH)
-    real_h0 = cap0.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    real_w1 = cap1.get(cv2.CAP_PROP_FRAME_WIDTH)
-    real_h1 = cap1.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    ROI_HALF = 30
 
-    print(f"[DEBUG] cam0 actual size: {int(real_w0)}x{int(real_h0)}")
-    print(f"[DEBUG] cam1 actual size: {int(real_w1)}x{int(real_h1)}")
+    # --- 카메라 오픈 & 미리보기 창 ---
+    cap0 = open_cam_with_size(CAM0, frame_size)
+    cap1 = open_cam_with_size(CAM1, frame_size)
+    if show_preview:
+        cv2.namedWindow("cam0_preview", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("cam1_preview", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("diff0", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("diff1", cv2.WINDOW_NORMAL)
 
-    # ✅ FOURCC 확인
-    print(f"[DEBUG] cam0 FOURCC:", cap0.get(cv2.CAP_PROP_FOURCC))
-    print(f"[DEBUG] cam1 FOURCC:", cap1.get(cv2.CAP_PROP_FOURCC))
-    # ====== 해상도 테스트 ==========================|
-
-    print(f"[DEBUG] 서보 각도 초기화 중: pitch={center_pitch}, yaw={center_yaw}")
-    ctl.set_angles(center_pitch, center_yaw)
-    time.sleep(servo_settle_s) # 0.5초
-    print("[DEBUG] 서보 초기 위치 설정 완료")
-
-    print("[DEBUG] 레이저 ON 명령 전송 중...")
-    ctl.laser_on()
-    time.sleep(0.2)
-    print("🔴 레이저 켜짐 — 클릭해서 레이저 점을 선택하세요")
-
-    cv2.namedWindow("cam0_preview", cv2.WINDOW_NORMAL)
-    cv2.namedWindow("cam1_preview", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("cam0_preview", W, H)
-    cv2.resizeWindow("cam1_preview", W, H)
-
-    def callback_left(event, x, y, flags, param):
-        nonlocal pt0
-        if event == cv2.EVENT_LBUTTONDOWN:
-            pt0 = (x, y)
-            print(f"🟢 Left cam0: {pt0}")
-
-    # 오른쪽 카메라 클릭 → cam1 좌표
-    def callback_right(event, x, y, flags, param):
-        nonlocal pt1
-        if event == cv2.EVENT_LBUTTONDOWN:
-            pt1 = (x, y)
-            print(f"🔵 Right cam1: {pt1}")
-
-    cv2.setMouseCallback("cam0_preview", callback_left)
-    cv2.setMouseCallback("cam1_preview", callback_right)
-
-    for _ in range(10):
-        cap0.read();cap1.read()
-    time.sleep(0.5)
-
- # --- 루프: 양쪽 영상 프리뷰 ---
-    while True:
+    # --- 보조: 회전 포함 프레임 획득 ---
+    def _grab_rotated():
         r0, f0 = cap0.read()
         r1, f1 = cap1.read()
         if not (r0 and r1):
-            print("⚠️ 카메라 프레임 읽기 실패")
-            time.sleep(0.2)
-            continue
+            raise RuntimeError("[find_laser] 카메라 프레임 획득 실패")
+        f0 = rotate_image(f0, ROTATE_MAP.get(CAM0))
+        f1 = rotate_image(f1, ROTATE_MAP.get(CAM1))
+        return f0, f1
 
-        f0r = rotate_image(f0, ROTATE_MAP.get(CAM0))
-        f1r = rotate_image(f1, ROTATE_MAP.get(CAM1))
+    # --- 보조: N프레임 워밍업 후 최종 한 장 반환 ---
+    def _settle_and_grab(n=8):
+        f0 = f1 = None
+        for _ in range(max(1, int(n))):
+            f0, f1 = _grab_rotated()
+        return f0, f1
 
-        # 미리보기 표시
-        cv2.imshow("cam0_preview", f0r)
-        cv2.imshow("cam1_preview", f1r)
+    # --- 서보 컨트롤러 ---
+    ctl = DualServoController(port, baud)
+    try:
+        # 0) 중립 각 → 안정화
+        try:
+            ctl.set_angles(center_pitch, center_yaw)  # (pitch, yaw)
+        except Exception as e:
+            print("[find_laser] center set_angles error:", e)
+        time.sleep(max(0.0, float(servo_settle_s)))
 
-        k = cv2.waitKey(1) & 0xFF
+        # 1) 미리보기에서 양쪽 ROI 중심 클릭(ENTER/SPACE 불필요)
+        roi_centers = {"cam0": None, "cam1": None}
 
-        # Enter로 확정 (양쪽 클릭 완료)
-        if k == 13 and pt0 is not None:
-            print(f"✅ 레이저 확정: L={pt0}, R={pt1}")
-            break
+        if show_preview:
+            def _on_mouse_cam0(event, x, y, flags, param):
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    roi_centers["cam0"] = (x, y)
+            def _on_mouse_cam1(event, x, y, flags, param):
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    roi_centers["cam1"] = (x, y)
 
-        # ESC로 초기화
-        elif k == 27:
-            pt0,pt1 = None, None
-            print("🔁 좌표 초기화")
-    print(f'============Ready to Laser off =============')
-    ctl.laser_off()
-    print(f'============ Laser off =============')
-    cap0.release()
-    cap1.release()
-    cv2.destroyAllWindows()
+            cv2.setMouseCallback("cam0_preview", _on_mouse_cam0)
+            cv2.setMouseCallback("cam1_preview", _on_mouse_cam1)
+            print("[find_laser] cam0, cam1 화면을 각각 클릭해서 ROI를 지정하세요. (정사각형, 한 변 = roi_box)")
 
-    # --- 안전한 크기 추출 ---
-    H0, W0 = f0r.shape[:2]
+            while roi_centers["cam0"] is None or roi_centers["cam1"] is None:
+                try:
+                    prev0, prev1 = _grab_rotated()
+                except Exception:
+                    continue
+
+                H0, W0 = prev0.shape[:2]
+                H1, W1 = prev1.shape[:2]
+                disp0, disp1 = prev0.copy(), prev1.copy()
+
+                # cam0 ROI 박스
+                mx0, my0 = roi_centers["cam0"] if roi_centers["cam0"] else (W0 // 2, H0 // 2)
+                x10 = max(0, mx0 - ROI_HALF); y10 = max(0, my0 - ROI_HALF)
+                x20 = min(W0 - 1, mx0 + ROI_HALF); y20 = min(H0 - 1, my0 + ROI_HALF)
+                cv2.rectangle(disp0, (x10, y10), (x20, y20),
+                              (0, 0, 0) if roi_centers["cam0"] else (0, 0, 255), 2, cv2.LINE_AA)
+                msg0 = "cam0: 클릭하여 ROI 확정" if roi_centers["cam0"] is None else "cam0: 확정됨"
+                cv2.putText(disp0, msg0, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+
+                # cam1 ROI 박스
+                mx1, my1 = roi_centers["cam1"] if roi_centers["cam1"] else (W1 // 2, H1 // 2)
+                x11 = max(0, mx1 - ROI_HALF); y11 = max(0, my1 - ROI_HALF)
+                x21 = min(W1 - 1, mx1 + ROI_HALF); y21 = min(H1 - 1, my1 + ROI_HALF)
+                cv2.rectangle(disp1, (x11, y11), (x21, y21),
+                              (0, 0, 0) if roi_centers["cam1"] else (0, 0, 255), 2, cv2.LINE_AA)
+                msg1 = "cam1: 클릭하여 ROI 확정" if roi_centers["cam1"] is None else "cam1: 확정됨"
+                cv2.putText(disp1, msg1, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+
+                cv2.imshow("cam0_preview", disp0)
+                cv2.imshow("cam1_preview", disp1)
+                cv2.waitKey(10)  # 이벤트 펌프
+
+            # 더 이상 클릭 안 받음
+            cv2.setMouseCallback("cam0_preview", lambda *a: None)
+            cv2.setMouseCallback("cam1_preview", lambda *a: None)
+
+        # 2) 프레임 크기 확정(회전 후)
+        ref0, ref1 = _grab_rotated()
+        H0, W0 = ref0.shape[:2]
+        H1, W1 = ref1.shape[:2]
+
+        mx0, my0 = roi_centers["cam0"] if roi_centers["cam0"] else (W0 // 2, H0 // 2)
+        x10 = max(0, mx0 - ROI_HALF); y10 = max(0, my0 - ROI_HALF)
+        x20 = min(W0 - 1, mx0 + ROI_HALF); y20 = min(H0 - 1, my0 + ROI_HALF)
+
+        mx1, my1 = roi_centers["cam1"] if roi_centers["cam1"] else (W1 // 2, H1 // 2)
+        x11 = max(0, mx1 - ROI_HALF); y11 = max(0, my1 - ROI_HALF)
+        x21 = min(W1 - 1, mx1 + ROI_HALF); y21 = min(H1 - 1, my1 + ROI_HALF)
+
+        # 3) ON → OFF 캡처(해당 ROI만 차분 사용)
+        try: ctl.laser_on()
+        except Exception as e: print("[find_laser] laser_on error:", e)
+        time.sleep(max(0.0, float(wait_s)))
+        ON0, ON1 = _settle_and_grab(settle_n)
+
+        try: ctl.laser_off()
+        except Exception as e: print("[find_laser] laser_off error:", e)
+        time.sleep(max(0.0, float(wait_s)))
+        OFF0, OFF1 = _settle_and_grab(settle_n)
+
+        # 절대차(전체 계산 후 ROI에서 최대점)
+        _, d0_full = diff_maps(OFF0, ON0)
+        _, d1_full = diff_maps(OFF1, ON1)
+
+        pt0 = None
+        roi0 = d0_full[y10:y20, x10:x20]
+        if roi0.size > 0:
+            loc0 = max_change_pixel(roi0, border_ignore=0, require_positive=False)
+            if loc0 is not None:
+                pt0 = (x10 + loc0[0], y10 + loc0[1])
+
+        pt1 = None
+        roi1 = d1_full[y11:y21, x11:x21]
+        if roi1.size > 0:
+            loc1 = max_change_pixel(roi1, border_ignore=0, require_positive=False)
+            if loc1 is not None:
+                pt1 = (x11 + loc1[0], y11 + loc1[1])
+
+        # 시각화
+        if show_preview:
+            d8_0 = cv2.normalize(d0_full, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            d8_1 = cv2.normalize(d1_full, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            over0, heat0 = overlay_heat(ON0.copy(), d8_0)
+            over1, heat1 = overlay_heat(ON1.copy(), d8_1)
+
+            cv2.rectangle(over0, (x10, y10), (x20, y20), (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.rectangle(over1, (x11, y11), (x21, y21), (0, 0, 0), 2, cv2.LINE_AA)
+
+            over0 = draw_point(over0, pt0)
+            over1 = draw_point(over1, pt1)
+            if pt0 is not None:
+                cv2.drawMarker(heat0, pt0, (0,255,0), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+            if pt1 is not None:
+                cv2.drawMarker(heat1, pt1, (0,255,0), cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+
+            cv2.imshow("cam0_preview", over0)
+            cv2.imshow("cam1_preview", over1)
+            cv2.imshow("diff0", heat0)
+            cv2.imshow("diff1", heat1)
+            cv2.waitKey(1)
+
+    finally:
+        try: cap0.release(); cap1.release()
+        except: pass
+        try: cv2.destroyAllWindows()
+        except: pass
+        try: ctl.close()
+        except: pass
 
     return {
-        "image_size": (W0, H0),  # cam0 회전 후 크기 (W,H)
-        "cam0": (int(pt0[0]), int(pt0[1])),
-        "cam1": (int(pt1[0]), int(pt1[1]))
+        "image_size": (W0, H0),  # cam0 기준(회전 후) 실제 크기 반환
+        "cam0": (int(pt0[0]), int(pt0[1])) if pt0 is not None else None,
+        "cam1": (int(pt1[0]), int(pt1[1])) if pt1 is not None else None,
     }
 
 def main():
@@ -320,6 +321,9 @@ def main():
         r0, f0 = cap0.read()
         r1, f1 = cap1.read()
         if not (r0 and r1): break
+        
+        f0 = rotate_image(f0, ROTATE_MAP.get(CAM0))
+        f1 = rotate_image(f1, ROTATE_MAP.get(CAM1))
 
         # 상태 표시
         v0, v1 = f0.copy(), f1.copy()

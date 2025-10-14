@@ -90,12 +90,6 @@ ROTATE_MAP = {
     2: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
 }
 
-LEFT_HAND_SET  = {"left_wrist","left_index","left_thumb","left_pinky"}
-RIGHT_HAND_SET = {"right_wrist","right_index","right_thumb","right_pinky"}
-
-LEFT_FOOT_SET  = {"left_heel","left_foot_index"}
-RIGHT_FOOT_SET = {"right_heel","right_foot_index"}
-
 CAP_SIZE = (1024, 576)
 size = CAP_SIZE 
 # ======== Servo controller import (stub fallback) ========
@@ -609,31 +603,6 @@ def build_servo_targets(by_id, yaw_laser0, pitch_laser0, X_laser, O):
         servo_targets[hid] = (ty, tp)
     return servo_targets
 
-def _resolve_group_from_csv_part(tpart_csv: str):
-    """
-    CSV의 part명을 '쪽+그룹'으로 매핑.
-    예) left_index -> ('left_hand', LEFT_HAND_SET)
-        right_foot_index -> ('right_foot', RIGHT_FOOT_SET)
-    """
-    if not tpart_csv:
-        return None, set()
-    p = tpart_csv.strip().lower()
-
-    if p.startswith("left_"):
-        if any(k in p for k in ["foot","heel","ankle","toe"]):
-            return "left_foot", set(LEFT_FOOT_SET)
-        else:
-            return "left_hand", set(LEFT_HAND_SET)
-
-    if p.startswith("right_"):
-        if any(k in p for k in ["foot","heel","ankle","toe"]):
-            return "right_foot", set(RIGHT_FOOT_SET)
-        else:
-            return "right_hand", set(RIGHT_HAND_SET)
-
-    # 애매하면 안전하게 실패 처리
-    return None, set()
-
 # === (NEW) CSV에서 (part, hold_id) 순서 로드 ===
 def load_route_pairs_from_csv(path):
     route_pairs = []
@@ -655,6 +624,37 @@ def load_route_pairs_from_csv(path):
     except FileNotFoundError:
         print(f"[Warn] 경로 CSV '{path}' 없음 → 기본 순서 사용 불가")
     return route_pairs
+
+def _resolve_part_name(tpart: str, coords: dict, grip_names: set):
+    """
+    CSV의 part 이름을 MediaPipe coords 키로 정규화.
+    1) 완전일치
+    2) 느슨한 매칭(서로 포함/접두)
+    3) tip/dip/pip/mcp 꼬리표 제거 후 grip_parts와 근사 매칭
+    못 찾으면 None
+    """
+    if not coords or not tpart:
+        return None
+    if tpart in coords:
+        return tpart
+
+    keys = list(coords.keys())
+    # 느슨한 매칭
+    for k in keys:
+        if k.startswith(tpart) or tpart.startswith(k) or (tpart in k) or (k in tpart):
+            return k
+
+    # suffix 제거 후 근사
+    base = tpart
+    for suffix in ["_tip", "_dip", "_pip", "_mcp"]:
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    for g in (grip_names or []):
+        if g == base or g in tpart or base in g:
+            for k in keys:
+                if g in k or k in g:
+                    return k
+    return None
 
 def _run_frame_loop(cap1, cap2, size,
                     SWAP_DISPLAY, laser_px,
@@ -863,57 +863,49 @@ def _run_frame_loop(cap1, cap2, size,
                 hold = holdsL_by_id.get(tid)
 
                 advanced_this_frame = False
-                current_touched_groups = set()  # 이번 프레임에 '성공'한 그룹 키 모음 (관절 단위 X)
+                current_touched = set()
 
-                group_name, group_set = _resolve_group_from_csv_part(tpart_csv)
+                # ▼ part 이름 정규화
+                tpart = _resolve_part_name(tpart_csv, coords, getattr(pose, "grip_parts", set()))
 
                 if hold is None:
                     cv2.putText(vis, f"[WARN] hold_id {tid} not on LEFT", (20, 64),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
                     cv2.putText(vis, f"[WARN] hold_id {tid} not on LEFT", (20, 64),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,140,255), 1, cv2.LINE_AA)
-                elif group_name is None or not group_set:
-                    cv2.putText(vis, f"[WARN] cannot resolve group from '{tpart_csv}'", (20, 46),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
-                    cv2.putText(vis, f"[WARN] cannot resolve group from '{tpart_csv}'", (20, 46),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,140,255), 1, cv2.LINE_AA)
                 else:
-                    # 이 그룹의 관절 중 '현재 프레임에서 존재하는' 것만 후보
-                    candidate_parts = [n for n in group_set if n in coords]
+                    if tpart is None:
+                        # 좌표 키가 없으면 이번 프레임 스킵(눈에 보이게 경고)
+                        cv2.putText(vis, f"[WARN] part '{tpart_csv}' not in coords", (20, 46),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+                        cv2.putText(vis, f"[WARN] part '{tpart_csv}' not in coords", (20, 46),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,140,255), 1, cv2.LINE_AA)
+                    else:
+                        x, y = coords[tpart]
+                        inside = cv2.pointPolygonTest(hold["contour"], (x, y), False) >= 0
+                        key = (tpart, tid)
+                        if inside:
+                            current_touched.add(key)
 
-                    # 폴리곤 내부에 '그룹 중 아무 관절'이라도 들어오면 터치로 인정
-                    inside_any = False
-                    who_trig = None
-                    for n in candidate_parts:
-                        x, y = coords[n]
-                        if cv2.pointPolygonTest(hold["contour"], (x, y), False) >= 0:
-                            inside_any = True
-                            who_trig = n
-                            break
+                        # blocking 로직 유지
+                        if inside and (tpart in pose.blocking_parts):
+                            if not blocked_state.get(key, False):
+                                blocked_state[key] = True
+                        else:
+                            blocked_state[key] = False
 
-                    # 스트릭 키를 '그룹 단위'로 묶음 → 관절이 바뀌어도 연속 유지
-                    key = (f"group:{group_name}", tid)
-                    if inside_any:
-                        current_touched_groups.add(key)
+                    # 스트릭 진행상황 HUD (디버깅용)
+                    cnt = touch_streak.get((tpart or tpart_csv, tid), 0)
+                    cv2.putText(vis, f"[GRIP] {tpart or tpart_csv}@{tid} {cnt}/{TOUCH_THRESHOLD}",
+                                (20, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,0), 3, cv2.LINE_AA)
+                    cv2.putText(vis, f"[GRIP] {tpart or tpart_csv}@{tid} {cnt}/{TOUCH_THRESHOLD}",
+                                (20, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (50,220,50), 2, cv2.LINE_AA)
 
-                    # (옵션) 블로킹 로직: 그룹으로 보므로 보수적으로 끔/완화
-                    # 그룹 터치가 감지되면 blocked_state를 해제해 false-positive로 인해 못 넘어가는 상황 방지
-                    blocked_state[key] = False
+                    # 스트릭 갱신/체크
+                    for key in current_touched:
+                        touch_streak[key] = touch_streak.get(key, 0) + 1
 
-                    # 디버그 HUD: 스트릭 진행상황 + 트리거 관절 표시
-                    cnt = touch_streak.get(key, 0)
-                    hud = f"[GRIP] {group_name}@{tid} {cnt}/{TOUCH_THRESHOLD}"
-                    if who_trig: hud += f" by {who_trig}"
-                    cv2.putText(vis, hud, (20, 86),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,0), 3, cv2.LINE_AA)
-                    cv2.putText(vis, hud, (20, 86),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (50,220,50), 2, cv2.LINE_AA)
-
-                    # 스트릭 갱신 및 임계 도달 체크
-                    for k2 in current_touched_groups:
-                        touch_streak[k2] = touch_streak.get(k2, 0) + 1
-
-                        if touch_streak[k2] >= TOUCH_THRESHOLD:
+                        if touch_streak[key] >= TOUCH_THRESHOLD:
                             now_t = time.time()
                             if (auto_advance_enabled
                                 and (route_pos < len(route_pairs) - 1)
@@ -921,6 +913,8 @@ def _run_frame_loop(cap1, cap2, size,
                                 and not advanced_this_frame):
 
                                 next_part, next_tid = route_pairs[route_pos + 1]
+
+                                # 서보 타깃 방어적 접근
                                 ty_tp = servo_targets.get(next_tid)
                                 if ty_tp is None:
                                     print(f"[Route] servo target missing for id {next_tid} — skip advance this frame")
@@ -936,16 +930,13 @@ def _run_frame_loop(cap1, cap2, size,
                                     last_advanced_time = now_t
                                     advanced_this_frame = True
 
-                                    # 다음 타깃 위해 스트릭 전체 초기화
                                     touch_streak.clear()
                                     break
 
-                    # 이번 프레임에 '그룹'이 터치되지 않은 키만 0으로 리셋
-                    # (엄지→손목처럼 관절이 바뀌어도 같은 그룹이면 유지됨)
-                    for k2 in list(touch_streak.keys()):
-                        k2_is_target = (isinstance(k2, tuple) and len(k2) == 2 and k2[1] == tid)
-                        if k2_is_target and k2 not in current_touched_groups:
-                            touch_streak[k2] = 0
+                    # 이번 프레임에 안 닿은 키 리셋
+                    for key in list(touch_streak.keys()):
+                        if key not in current_touched:
+                            touch_streak[key] = 0
 
             # FPS
             t_now = time.time()
@@ -1055,6 +1046,17 @@ def main():
     route_pairs = load_route_pairs_from_csv(CSV_GRIPS_PATH_dyn)
     if not route_pairs:
         print("[Route] CSV 경로가 비었거나 없음 — (part, hold_id) 기반 진행 불가")
+        return
+
+    # route 유효성 필터: 실제 공통 ID(=by_id.keys) & LEFT에 존재하는 것만
+    valid_hids = set({h["hold_index"] for h in holdsL}) & set(by_id.keys())
+    orig_n = len(route_pairs)
+    route_pairs = [(p, hid) for (p, hid) in route_pairs
+                if (p is not None and p != "") and (hid in valid_hids)]
+    if len(route_pairs) < orig_n:
+        print(f"[Route] CSV {orig_n} → 유효 {len(route_pairs)} (없는 id/빈 part 제거)")
+    if not route_pairs:
+        print("[Route] 유효 (part,hold_id) 없음 — 종료")
         return
 
     # 시작 포인터/타깃
