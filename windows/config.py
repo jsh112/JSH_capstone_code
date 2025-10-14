@@ -19,7 +19,7 @@ ADV_COOLDOWN    = 0.5    # 연속 넘김 방지 쿨다운(sec)
 SAVE_VIDEO     = False
 OUT_FPS        = 30
 OUT_PATH       = "stereo_overlay.mp4"
-CSV_GRIPS_PATH = "route/grip_records.csv"
+CSV_GRIPS_PATH = "grip_records.csv"
 
 # 런타임 보정 오프셋(레이저 실측)
 CAL_YAW_OFFSET   = 0.0

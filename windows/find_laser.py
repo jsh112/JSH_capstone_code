@@ -203,7 +203,8 @@ def draw_point(frame, pt):
 def capture_once_and_return(port="COM15", baud=115200,
                             center_pitch=90.0, center_yaw=90.0,
                             servo_settle_s=0.5,
-                            ctl=None):
+                            frame_size=(1024, 576)
+                            ):
     from servo_control import DualServoController
     import time, cv2
 
