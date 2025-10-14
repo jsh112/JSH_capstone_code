@@ -10,29 +10,24 @@ import argparse
 from Climb_Mediapipe import PoseTracker, draw_pose_points, classify_occluder
 
 # 레이저 찾기
-from find_laser import capture_once_and_return, rotate_image
+from find_laser import capture_once_and_return
 
 # hold 관련 코드
-from A_hold_utils import extract_holds_with_indices, merge_holds_by_center, assign_indices
+from A_hold_utils import initial_5frames_all_classes
 
 # servo 관련 코드
 from A_servo_utils import send_servo_angles, yaw_pitch_from_X
 
-# 색상 선택
-from A_color_select import choose_color
+from A_click_select import interactive_select_both
 
-# 테스트
-from test import list_cameras
-
-# config
-from config import *
+from A_web import choose_color_via_web
 
 # ========= 사용자 환경 경로 =========
-NPZ_PATH       = r"./param/stereo_params_1024_576.npz"
-MODEL_PATH     = r"./param/best_6.pt"
+NPZ_PATH       = r"C:\Users\PC\Desktop\Segmentation_Hold\stereo_params.npz"
+MODEL_PATH     = r"C:\Users\PC\Desktop\Segmentation_Hold\best_5.pt"
 
-CAM1_INDEX     = 2   # 왼쪽 카메라
-CAM2_INDEX     = 3   # 오른쪽 카메라
+CAM1_INDEX     = 1   # 왼쪽 카메라
+CAM2_INDEX     = 2   # 오른쪽 카메라
 
 SWAP_DISPLAY   = False   # 화면 표시 좌/우 스와프
 
@@ -41,14 +36,14 @@ THRESH_MASK    = 0.7
 ROW_TOL_Y      = 30
 
 # 자동 진행(터치→다음 홀드) 관련
-TOUCH_THRESHOLD = 10     # in-polygon 연속 프레임 임계(기본 10)
+TOUCH_THRESHOLD = 5     # in-polygon 연속 프레임 임계(기본 10)
 ADV_COOLDOWN    = 0.5    # 연속 넘김 방지 쿨다운(sec)
 
 # 저장 옵션
 SAVE_VIDEO     = False
 OUT_FPS        = 30
 OUT_PATH       = "stereo_overlay.mp4"
-CSV_GRIPS_PATH = "route/grip_records.csv"
+CSV_GRIPS_PATH = "grip_records.csv"
 
 # 런타임 보정 오프셋(레이저 실측)
 CAL_YAW_OFFSET   = 0.0
@@ -91,11 +86,17 @@ FRAC_DYN_MIN   = 0.55      # 동적 임계(노이즈 적응) 기준 비율
 ERODE_ITERS    = 1         # 마스크 코어만 사용(경계 흔들림 억제). 0~1 권장
 
 ROTATE_MAP = {
-    2: cv2.ROTATE_90_COUNTERCLOCKWISE,  # LEFT
-    3: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
+    1: cv2.ROTATE_90_COUNTERCLOCKWISE,  # LEFT
+    2: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
 }
 
-CAP_SIZE = (1280, 720)
+LEFT_HAND_SET  = {"left_wrist","left_index","left_thumb","left_pinky"}
+RIGHT_HAND_SET = {"right_wrist","right_index","right_thumb","right_pinky"}
+
+LEFT_FOOT_SET  = {"left_heel","left_foot_index"}
+RIGHT_FOOT_SET = {"right_heel","right_foot_index"}
+
+CAP_SIZE = (1024, 576)
 size = CAP_SIZE 
 # ======== Servo controller import (stub fallback) ========
 try:
@@ -113,9 +114,12 @@ except Exception:
         def close(self): pass
 # ======================
 
+def rotate_image(img, rot_code):
+    return cv2.rotate(img, rot_code) if rot_code is not None else img
+
 def rotate_point(pt, shape_hw, rot_code):
     """(x,y) 픽셀을 주어진 회전 코드로 변환. shape_hw는 '회전 전'의 (H,W)."""
-    if pt is None or rot_code is None:
+    if pt is None or rot_code is None: 
         return pt
     h, w = shape_hw
     x, y = int(pt[0]), int(pt[1])
@@ -159,10 +163,11 @@ def triangulate_xy_raw(P1, P2, ptL_px, ptR_px, K1, D1, K2, D2):
 
 def _parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM6")
+    ap.add_argument("--port", default="COM15")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--no_auto_advance", action="store_true")
     ap.add_argument("--no_web", action="store_true")
+    ap.add_argument("--laser_on", action="store_true")
     return ap.parse_args()
 
 def _verify_paths():
@@ -244,12 +249,12 @@ def _load_stereo_and_log():
     print("[Info] (RAW) using P1=K1[I|0], P2=K2[R|T]")
     return K1, D1, K2, D2, R, T, P1, P2
 
-def _capture_laser_raw(args,ctl=None):
+def _capture_laser_raw(args):
     try:
         laser_raw = capture_once_and_return(
             port=args.port, baud=args.baud,
-            center_pitch=90.0, center_yaw=90.0, servo_settle_s=0.5,
-            ctl=ctl
+            wait_s=2.0, settle_n=8, show_preview=True,
+            center_pitch=90.0, center_yaw=90.0, servo_settle_s=0.5, frame_size=(1024, 576),
         )
     except Exception as e:
         print(f"[A_Climbing] find_laser error: {e} → continue without laser")
@@ -274,63 +279,149 @@ def compute_laser_origin_mid(T):
     print(f"[Laser] Origin O (mm, MID-based) = {O}")
     return L, O
 
-# def _open_cameras_and_model(size):
-#     capL_idx, capR_idx = CAM1_INDEX, CAM2_INDEX
-#     cap1, cap2 = open_cams(capL_idx, capR_idx, size)
-#     model = YOLO(str(MODEL_PATH))
-#     return cap1, cap2, model
-
 def _open_cameras_and_model(size):
     capL_idx, capR_idx = CAM1_INDEX, CAM2_INDEX
-    print(f"\n🎥 [Debug] Trying to open cameras: LEFT={capL_idx}, RIGHT={capR_idx}")
-
     cap1, cap2 = open_cams(capL_idx, capR_idx, size)
-
-    # ✅ 실제로 어떤 프레임이 열렸는지 확인
-    ok1, f1 = cap1.read()
-    ok2, f2 = cap2.read()
-    if ok1:
-        print(f"  ✅ LEFT  ({capL_idx}) opened — frame shape: {f1.shape}")
-    else:
-        print(f"  ❌ LEFT  ({capL_idx}) failed to read frame")
-    if ok2:
-        print(f"  ✅ RIGHT ({capR_idx}) opened — frame shape: {f2.shape}")
-    else:
-        print(f"  ❌ RIGHT ({capR_idx}) failed to read frame")
-
-    # ✅ YOLO 모델 로드 시점 표시
-    print("⚙️  Loading YOLO model...")
     model = YOLO(str(MODEL_PATH))
-    print("✅ YOLO model loaded.\n")
-
     return cap1, cap2, model
 
-def _initial_seg_merge(cap1, cap2, model, selected_class_name):
-    L_sets, R_sets = [], []
-    for _ in range(2):
-        cap1.read(); cap2.read()
+def _cluster_rows_by_y(holds, row_tol=30):
+    """y기준으로 행 클러스터링: [(row_y, [idx들])] 반환"""
+    rows = []
+    for i, h in enumerate(holds):
+        cy = h["center"][1]
+        assigned = False
+        for row in rows:
+            if abs(cy - row["y"]) <= row_tol:
+                row["idxs"].append(i)
+                row["y"] = int(round(np.mean([holds[j]["center"][1] for j in row["idxs"]])))
+                assigned = True
+                break
+        if not assigned:
+            rows.append({"y": int(cy), "idxs": [i]})
+    # y 오름차순
+    rows.sort(key=lambda r: r["y"])
+    return [(r["y"], r["idxs"]) for r in rows]
 
-    for k in range(5):
-        ok1, f1 = cap1.read(); ok2, f2 = cap2.read()
-        if not (ok1 and ok2):
-            cap1.release(); cap2.release()
-            raise SystemExit("초기 프레임 캡쳐 실패")
+def _pair_and_assign_by_relpos(holdsL, selL, holdsR, selR, W, H, wx=1.0, wy=2.0, debug=False):
+    """
+    좌/우에서 '선택된' 홀드들만 가져와서, (x/W, y/H) 상대좌표 기반 1:1 최적 할당.
+    - 비용: wy*|yL - yR| + wx*|xL_norm - xR_norm|
+    - 결과 개수 = min(len(selL), len(selR))  (항상 1:1)
+    - 각 쌍에 동일한 hold_index를 0..n-1 부여
+    """
+    # 1) 좌/우 선택 좌표 추출
+    Lpts = []
+    for i in selL:
+        cx, cy = holdsL[i]["center"]
+        Lpts.append((i, float(cx)/W, float(cy)/H))
+    Rpts = []
+    for j in selR:
+        cx, cy = holdsR[j]["center"]
+        Rpts.append((j, float(cx)/W, float(cy)/H))
 
-        f1 = rotate_image(f1, ROTATE_MAP.get(CAM1_INDEX))
-        f2 = rotate_image(f2, ROTATE_MAP.get(CAM2_INDEX))
+    nL, nR = len(Lpts), len(Rpts)
+    n = min(nL, nR)
+    if n == 0:
+        return [], []
 
-        holdsL_k = extract_holds_with_indices(f1, model, selected_class_name, THRESH_MASK, ROW_TOL_Y)
-        holdsR_k = extract_holds_with_indices(f2, model, selected_class_name, THRESH_MASK, ROW_TOL_Y)
-        L_sets.append(holdsL_k); R_sets.append(holdsR_k)
-        print(f"  - frame {k+1}/5: L={len(holdsL_k)}  R={len(holdsR_k)}")
+    # 2) 비용 행렬 구성 (실제 y 픽셀 차보다 "상대 y"를 쓰고 싶으면 /H 하세요)
+    #    여기서는 y도 0~1로 맞춰 스케일 편향 제거
+    import math
+    C = [[0.0]*nR for _ in range(nL)]
+    for a, (_, xLn, yLn) in enumerate(Lpts):
+        for b, (_, xRn, yRn) in enumerate(Rpts):
+            cost = wy*abs(yLn - yRn) + wx*abs(xLn - xRn)
+            C[a][b] = cost
 
-    holdsL = assign_indices(merge_holds_by_center(L_sets, 18), ROW_TOL_Y)
-    holdsR = assign_indices(merge_holds_by_center(R_sets, 18), ROW_TOL_Y)
-    if not holdsL or not holdsR:
-        cap1.release(); cap2.release()
-        print("[Warn] 왼/오 프레임에서 홀드가 검출되지 않았습니다.")
-        return None, None
-    return holdsL, holdsR
+    # 3) 헝가리안 (O(n^3)) — 외부 라이브러리 없이 경량 구현
+    #    참고: n<=40 정도는 충분히 빠름
+    def hungarian(cost):
+        nL = len(cost)
+        nR = len(cost[0]) if nL else 0
+        n  = max(nL, nR)
+        # 정사각으로 패딩
+        BIG = 1e9
+        M = [row[:] + [BIG]*(nR - len(row)) for row in cost] + [[BIG]*max(nR,n)]*(n - nL)
+        # u, v potentials
+        u = [0.0]*(n+1)
+        v = [0.0]*(n+1)
+        p = [0]*(n+1)
+        way = [0]*(n+1)
+        for i in range(1, n+1):
+            p[0] = i
+            j0 = 0
+            minv = [float('inf')]*(n+1)
+            used = [False]*(n+1)
+            while True:
+                used[j0] = True
+                i0 = p[j0]
+                delta = float('inf')
+                j1 = 0
+                for j in range(1, n+1):
+                    if not used[j]:
+                        cur = M[i0-1][j-1] - u[i0] - v[j]
+                        if cur < minv[j]:
+                            minv[j] = cur
+                            way[j] = j0
+                        if minv[j] < delta:
+                            delta = minv[j]
+                            j1 = j
+                for j in range(0, n+1):
+                    if used[j]:
+                        u[p[j]] += delta
+                        v[j] -= delta
+                    else:
+                        minv[j] -= delta
+                j0 = j1
+                if p[j0] == 0:
+                    break
+            while True:
+                j1 = way[j0]
+                p[j0] = p[j1]
+                j0 = j1
+                if j0 == 0:
+                    break
+        # p[j] = i  (i는 1..n) → (i-1) ↔ (j-1) 매칭
+        matchLR = [-1]*n
+        for j in range(1, n+1):
+            if p[j] != 0:
+                matchLR[j-1] = p[j]-1
+        # 원래 크기로 절단
+        pairs = []
+        for j in range(min(nR, n)):
+            i = matchLR[j]
+            if 0 <= i < nL:
+                pairs.append((i, j))
+        return pairs
+
+    pairs_idx = hungarian(C)
+
+    # 4) 상위 n개만 사용 (비용 낮은 것부터) — 이미 최적이지만, nL!=nR인 경우 n개로 컷
+    #    pairs_idx는 (iL_idx_in_sel, iR_idx_in_sel)
+    #    sel 인덱스를 holds 인덱스로 변환
+    #    정렬은 보기 좋게 좌측 y오름차순으로
+    matched = []
+    for i_sel, j_sel in pairs_idx:
+        idxL = selL[i_sel]
+        idxR = selR[j_sel]
+        matched.append((idxL, idxR))
+    # 좌측 y 기준 정렬(선택)
+    matched.sort(key=lambda t: holdsL[t[0]]["center"][1])
+
+    # 5) hold_index 부여 & 출력 리스트 구성
+    L_out, R_out = [], []
+    hid = 0
+    for iL, iR in matched[:n]:
+        holdsL[iL]["hold_index"] = hid
+        holdsR[iR]["hold_index"] = hid
+        L_out.append(holdsL[iL])
+        R_out.append(holdsR[iR])
+        hid += 1
+
+    if debug:
+        print(f"[Pair-RelPos] L_sel={len(selL)}, R_sel={len(selR)} → matched={len(L_out)}")
+    return L_out, R_out
 
 def _build_common_ids(holdsL, holdsR):
     idxL = {h["hold_index"]: h for h in holdsL}
@@ -487,7 +578,7 @@ def _init_servo_and_point_first(ctl, args, current_target_id, by_id, X_laser, O,
 
     return cur_yaw, cur_pitch
 
-def _event_loop(size):
+def _event_loop( size):
     W, H = size
     pose = PoseTracker(min_detection_confidence=0.5, model_complexity=1)
     blocked_state = {}   # (part, hold_id)별 차폐 상태
@@ -517,6 +608,31 @@ def build_servo_targets(by_id, yaw_laser0, pitch_laser0, X_laser, O):
         tp = max(0.0, min(180.0, tp))
         servo_targets[hid] = (ty, tp)
     return servo_targets
+
+def _resolve_group_from_csv_part(tpart_csv: str):
+    """
+    CSV의 part명을 '쪽+그룹'으로 매핑.
+    예) left_index -> ('left_hand', LEFT_HAND_SET)
+        right_foot_index -> ('right_foot', RIGHT_FOOT_SET)
+    """
+    if not tpart_csv:
+        return None, set()
+    p = tpart_csv.strip().lower()
+
+    if p.startswith("left_"):
+        if any(k in p for k in ["foot","heel","ankle","toe"]):
+            return "left_foot", set(LEFT_FOOT_SET)
+        else:
+            return "left_hand", set(LEFT_HAND_SET)
+
+    if p.startswith("right_"):
+        if any(k in p for k in ["foot","heel","ankle","toe"]):
+            return "right_foot", set(RIGHT_FOOT_SET)
+        else:
+            return "right_hand", set(RIGHT_HAND_SET)
+
+    # 애매하면 안전하게 실패 처리
+    return None, set()
 
 # === (NEW) CSV에서 (part, hold_id) 순서 로드 ===
 def load_route_pairs_from_csv(path):
@@ -743,63 +859,93 @@ def _run_frame_loop(cap1, cap2, size,
             # === (핵심) 목표 (part, hold_id)만 판정 ===
             if coords and (current_target_id in {h["hold_index"] for h in holdsL}):
                 tid  = current_target_id
-                tpart = current_target_part
-                hold = holdsL_by_id[tid]
+                tpart_csv = current_target_part
+                hold = holdsL_by_id.get(tid)
 
                 advanced_this_frame = False
+                current_touched_groups = set()  # 이번 프레임에 '성공'한 그룹 키 모음 (관절 단위 X)
 
-                # 오직 목표 part만 검사
-                current_touched = set()
-                if tpart in coords:
-                    x, y = coords[tpart]
-                    inside = cv2.pointPolygonTest(hold["contour"], (x, y), False) >= 0
-                    key = (tpart, tid)
-                    if inside:
-                        current_touched.add(key)
+                group_name, group_set = _resolve_group_from_csv_part(tpart_csv)
 
-                    # 기존 blocking 로직 유지(목표 part만)
-                    if inside and (tpart in pose.blocking_parts):
-                        if not blocked_state.get(key, False):
-                            blocked_state[key] = True
-                    else:
-                        blocked_state[key] = False
+                if hold is None:
+                    cv2.putText(vis, f"[WARN] hold_id {tid} not on LEFT", (20, 64),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+                    cv2.putText(vis, f"[WARN] hold_id {tid} not on LEFT", (20, 64),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,140,255), 1, cv2.LINE_AA)
+                elif group_name is None or not group_set:
+                    cv2.putText(vis, f"[WARN] cannot resolve group from '{tpart_csv}'", (20, 46),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+                    cv2.putText(vis, f"[WARN] cannot resolve group from '{tpart_csv}'", (20, 46),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,140,255), 1, cv2.LINE_AA)
+                else:
+                    # 이 그룹의 관절 중 '현재 프레임에서 존재하는' 것만 후보
+                    candidate_parts = [n for n in group_set if n in coords]
 
-                # 스트릭 갱신 및 임계(10프레임) 도달 체크
-                for key in current_touched:
-                    touch_streak[key] = touch_streak.get(key, 0) + 1
-
-                    if touch_streak[key] >= TOUCH_THRESHOLD:
-
-                        # === 자동 진행: CSV 순서 그대로 다음 (part, hold_id)로 ===
-                        now_t = time.time()
-                        if (auto_advance_enabled
-                            and (route_pos < len(route_pairs) - 1)
-                            and (now_t - last_advanced_time) > ADV_COOLDOWN
-                            and not advanced_this_frame):
-
-                            next_part, next_tid = route_pairs[route_pos + 1]
-
-                            # 서보는 홀드 기준 → next_tid만 사용
-                            target_yaw, target_pitch = servo_targets[next_tid]
-                            send_servo_angles(ctl, target_yaw, target_pitch)
-                            cur_yaw, cur_pitch = target_yaw, target_pitch
-
-                            # 포인터/타깃 전진
-                            route_pos += 1
-                            current_target_id   = next_tid
-                            current_target_part = next_part
-
-                            last_advanced_time = now_t
-                            advanced_this_frame = True
-
-                            # 다음 타깃 위해 스트릭 초기화
-                            touch_streak.clear()
+                    # 폴리곤 내부에 '그룹 중 아무 관절'이라도 들어오면 터치로 인정
+                    inside_any = False
+                    who_trig = None
+                    for n in candidate_parts:
+                        x, y = coords[n]
+                        if cv2.pointPolygonTest(hold["contour"], (x, y), False) >= 0:
+                            inside_any = True
+                            who_trig = n
                             break
 
-                # 이번 프레임에 안 닿은 키는 즉시 리셋 → 손/발 떼면 칠하기 해제
-                for key in list(touch_streak.keys()):
-                    if key not in current_touched:
-                        touch_streak[key] = 0
+                    # 스트릭 키를 '그룹 단위'로 묶음 → 관절이 바뀌어도 연속 유지
+                    key = (f"group:{group_name}", tid)
+                    if inside_any:
+                        current_touched_groups.add(key)
+
+                    # (옵션) 블로킹 로직: 그룹으로 보므로 보수적으로 끔/완화
+                    # 그룹 터치가 감지되면 blocked_state를 해제해 false-positive로 인해 못 넘어가는 상황 방지
+                    blocked_state[key] = False
+
+                    # 디버그 HUD: 스트릭 진행상황 + 트리거 관절 표시
+                    cnt = touch_streak.get(key, 0)
+                    hud = f"[GRIP] {group_name}@{tid} {cnt}/{TOUCH_THRESHOLD}"
+                    if who_trig: hud += f" by {who_trig}"
+                    cv2.putText(vis, hud, (20, 86),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,0), 3, cv2.LINE_AA)
+                    cv2.putText(vis, hud, (20, 86),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (50,220,50), 2, cv2.LINE_AA)
+
+                    # 스트릭 갱신 및 임계 도달 체크
+                    for k2 in current_touched_groups:
+                        touch_streak[k2] = touch_streak.get(k2, 0) + 1
+
+                        if touch_streak[k2] >= TOUCH_THRESHOLD:
+                            now_t = time.time()
+                            if (auto_advance_enabled
+                                and (route_pos < len(route_pairs) - 1)
+                                and (now_t - last_advanced_time) > ADV_COOLDOWN
+                                and not advanced_this_frame):
+
+                                next_part, next_tid = route_pairs[route_pos + 1]
+                                ty_tp = servo_targets.get(next_tid)
+                                if ty_tp is None:
+                                    print(f"[Route] servo target missing for id {next_tid} — skip advance this frame")
+                                else:
+                                    target_yaw, target_pitch = ty_tp
+                                    send_servo_angles(ctl, target_yaw, target_pitch)
+                                    cur_yaw, cur_pitch = target_yaw, target_pitch
+
+                                    route_pos += 1
+                                    current_target_id   = next_tid
+                                    current_target_part = next_part
+
+                                    last_advanced_time = now_t
+                                    advanced_this_frame = True
+
+                                    # 다음 타깃 위해 스트릭 전체 초기화
+                                    touch_streak.clear()
+                                    break
+
+                    # 이번 프레임에 '그룹'이 터치되지 않은 키만 0으로 리셋
+                    # (엄지→손목처럼 관절이 바뀌어도 같은 그룹이면 유지됨)
+                    for k2 in list(touch_streak.keys()):
+                        k2_is_target = (isinstance(k2, tuple) and len(k2) == 2 and k2[1] == tid)
+                        if k2_is_target and k2 not in current_touched_groups:
+                            touch_streak[k2] = 0
 
             # FPS
             t_now = time.time()
@@ -837,14 +983,6 @@ def _run_frame_loop(cap1, cap2, size,
 # ---------- 메인 ----------
 def main():
     args = _parse_args()
-    # ===== 10/14 -> JSH, 레이저가 켜지지 않고 꺼지는 오류 수정용 =====
-    ctl = DualServoController(args.port, args.baud)
-    # ===== 10/14 -> JSH, 레이저가 켜지지 않고 꺼지는 오류 수정용 =====
-
-    # ===== 10/14 -> JSH, 카메라가 잘 잡히지 않아서 debug용 print =====
-    cams = list_cameras()
-    print(f"\n총 {len(cams)}개의 카메라가 감지되었습니다.")
-    # ===== 10/14 -> JSH, 카메라가 잘 잡히지 않아서 debug용 print =====
 
     # 경로 검증
     _verify_paths()
@@ -853,12 +991,17 @@ def main():
     K1, D1, K2, D2, R, T, P1, P2 = _load_stereo_and_log()
 
     # 레이저 좌표 먼저 측정 (find_laser) → 보정좌표로 변환
-    laser_px = _capture_laser_raw(args, ctl=ctl)
+    laser_px = _capture_laser_raw(args)
 
     L, O = compute_laser_origin_mid(T)
 
-    # 색상 필터 선택 (A_web → 고정 → 콘솔)
-    selected_class_name, CSV_GRIPS_PATH_dyn = choose_color(args)
+    # 웹 스와치에서 색상 선택 ("" = 전체)
+    sel = choose_color_via_web()   # "green" / "red" / ... / ""(전체)
+
+    # 파일명용 슬러그: ""이면 "all"로 저장
+    color_slug = sel if sel else "all"
+    CSV_GRIPS_PATH_dyn = f"grip_records_{color_slug}.csv"
+    print(f"[Route] 웹 선택 색상='{sel or 'ALL'}' → CSV='{CSV_GRIPS_PATH_dyn}'")
 
     # 카메라 & 모델
     cap1, cap2, model = _open_cameras_and_model(CAP_SIZE)
@@ -870,11 +1013,32 @@ def main():
     proc_size = (W, H)
 
     # 초기 5프레임: YOLO seg & merge
-    holdsL, holdsR = _initial_seg_merge(cap1, cap2, model, selected_class_name)
-
+    # 1) 모든 클래스 5프레임 세그 + 병합(인덱스X)
+    holdsL = initial_5frames_all_classes(cap1, model, ROTATE_MAP.get(CAM1_INDEX),
+                                        n_frames=5, mask_thresh=THRESH_MASK, merge_dist_px=18)
+    holdsR = initial_5frames_all_classes(cap2, model, ROTATE_MAP.get(CAM2_INDEX),
+                                        n_frames=5, mask_thresh=THRESH_MASK, merge_dist_px=18)
     if not holdsL or not holdsR:
+        print("[Init] 홀드를 검출하지 못했습니다.")
         return
-    
+
+    # 2) 한 프레임씩 캡처(회전 포함) → 합성 화면에서 양쪽 클릭 선택
+    okL, frameL = cap1.read()
+    okR, frameR = cap2.read()
+    if not (okL and okR):
+        print("[Init] 프레임 캡처 실패"); return
+    Limg_now = rotate_image(frameL, ROTATE_MAP.get(CAM1_INDEX))
+    Rimg_now = rotate_image(frameR, ROTATE_MAP.get(CAM2_INDEX))
+
+    idxL, idxR = interactive_select_both(Limg_now, Rimg_now, holdsL, holdsR, swap_display=SWAP_DISPLAY,
+                                        window="Select Holds (L|R)")
+    if not idxL or not idxR:
+        print("[Select] 양쪽 선택이 필요합니다(선택 없음)."); return
+
+    holdsL, holdsR = _pair_and_assign_by_relpos(
+    holdsL, idxL, holdsR, idxR, W=proc_size[0], H=proc_size[1],
+    wx=1.0, wy=2.0, debug=True)
+
     hold_db = _build_hold_db_with_baseline(cap1, proc_size, holdsL, n_frames=5, diff_gate=12.0)
 
     # 공통 ID
@@ -916,7 +1080,7 @@ def main():
     _ = _run_frame_loop(cap1, cap2, proc_size,
                     SWAP_DISPLAY, laser_px,
                     holdsL, holdsR, matched_results,
-                    by_id, servo_targets,  # next_id_map은 안 써도 됨
+                    by_id, servo_targets,
                     (not args.no_auto_advance),
                     pose, blocked_state,
                     out, t_prev, last_advanced_time,
