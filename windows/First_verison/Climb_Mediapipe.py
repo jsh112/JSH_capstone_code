@@ -85,9 +85,14 @@ class PoseTracker:
         if not res or not res.pose_landmarks:
             return {}
         coords = {}
+        min_vis = 0.5
         for name, idx in self.important_landmarks.items():
             lm = res.pose_landmarks.landmark[idx]
-            coords[name] = (lm.x * w, lm.y * h)
+            if getattr(lm, "visibility", 1.0) < min_vis:
+                continue
+            x = max(0, min(w-1, lm.x * w))
+            y = max(0, min(h-1, lm.y * h))
+            coords[name] = (x, y)
         return coords
 
     def close(self):
@@ -255,10 +260,8 @@ def classify_occluder(center_xy, coords, shape_hw, grip_parts=None, hold_mask=No
     # 1) 홀드 마스크가 주어지면 '홀드 내부와 손/발 마스크의 교차'를 우선으로 판정
     if hold_mask is not None:
         # hold_mask이 이미 (H,W)라면 그대로, 아니면 예상되는 crop 대응은 호출부에서 처리
-        inter = cv2.bitwise_and(handsfeet_m, hold_mask)
-        union = cv2.bitwise_or(handsfeet_m, hold_mask)
-        iou = np.count_nonzero(inter) / max(np.count_nonzero(union), 1)
-        if iou > 0.10:
+        overlap = cv2.bitwise_and(handsfeet_m, hold_mask)
+        if np.count_nonzero(overlap) > 0:
             # 어느 손/발이 겹쳤는지 근접관절로 탐색해 리턴하면 더 좋음
             # 간단히 "hand/foot"로 표기
             return ("grip", "hand/foot")
@@ -275,19 +278,15 @@ def classify_occluder(center_xy, coords, shape_hw, grip_parts=None, hold_mask=No
         return ("blocked", "torso")
 
     # 3) 폴백: 가장 가까운 관절 (단, hand_parts는 grip 후보에서 제외)
-    if not coords:
-        return ("blocked", "unknown")
-    best_name, best_score = None, 1e18
-    for n, (x,y) in coords.items():
-        if grip_parts and n in grip_parts:
-            continue
-        dx, dy = x - cx, y - cy
-        d = np.hypot(dx, dy)
-        ang = np.degrees(np.arctan2(dy, dx))
-        # 중심 방향과의 각도 차이를 보정 — 옆으로 접근한 경우 감점
-        score = d + 0.3 * abs(ang % 180 - 90)
-        if score < best_score:
-            best_score, best_name = score, n
+    names = list(coords.keys())
+    if grip_parts:
+        names = [n for n in names if n not in grip_parts]
+    best_name, best_d2 = None, 1e18
+    for n in names:
+        x,y = coords[n]
+        d2 = (x-cx)*(x-cx) + (y-cy)*(y-cy)
+        if d2 < best_d2:
+            best_d2, best_name = d2, n
 
     HEAD_KEYS = {
         "nose",

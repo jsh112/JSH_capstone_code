@@ -1,5 +1,5 @@
 import cv2
-NPZ_PATH       = r"./param/stereo_params_1024_576_.npz"
+NPZ_PATH       = r"./param/stereo_params_1024_576.npz"
 MODEL_PATH     = r"./param/best_6.pt"
 
 CAM1_INDEX     = 2   # 왼쪽 카메라

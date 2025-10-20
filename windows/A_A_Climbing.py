@@ -23,11 +23,11 @@ from A_click_select import interactive_select_both
 from A_web import choose_color_via_web
 
 # ========= 사용자 환경 경로 =========
-NPZ_PATH       = r"C:\Users\PC\Desktop\Segmentation_Hold\stereo_params.npz"
-MODEL_PATH     = r"C:\Users\PC\Desktop\Segmentation_Hold\best_5.pt"
+NPZ_PATH       = r"./param/stereo_params_1024_576.npz"
+MODEL_PATH     = r"./param/best_6.pt"
 
-CAM1_INDEX     = 1   # 왼쪽 카메라
-CAM2_INDEX     = 2   # 오른쪽 카메라
+CAM1_INDEX     = 2   # 왼쪽 카메라
+CAM2_INDEX     = 3   # 오른쪽 카메라
 
 SWAP_DISPLAY   = False   # 화면 표시 좌/우 스와프
 
@@ -86,8 +86,8 @@ FRAC_DYN_MIN   = 0.55      # 동적 임계(노이즈 적응) 기준 비율
 ERODE_ITERS    = 1         # 마스크 코어만 사용(경계 흔들림 억제). 0~1 권장
 
 ROTATE_MAP = {
-    1: cv2.ROTATE_90_COUNTERCLOCKWISE,  # LEFT
-    2: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
+    2: cv2.ROTATE_90_COUNTERCLOCKWISE,  # LEFT
+    3: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
 }
 
 CAP_SIZE = (1024, 576)
@@ -157,7 +157,7 @@ def triangulate_xy_raw(P1, P2, ptL_px, ptR_px, K1, D1, K2, D2):
 
 def _parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM15")
+    ap.add_argument("--port", default="COM6")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--no_auto_advance", action="store_true")
     ap.add_argument("--no_web", action="store_true")

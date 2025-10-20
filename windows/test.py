@@ -77,8 +77,11 @@ def list_cameras(verbose=True):
 
     return camera_list
 
+from ultralytics import YOLO
+def hello():
+    model = YOLO("./param/best_6.pt")  # 또는 커스텀 weight
+    model.export(format="onnx", opset=12)
 
 # 단독 실행 시 목록 확인
 if __name__ == "__main__":
-    cams = list_cameras()
-    print(f"\n총 {len(cams)}개의 카메라가 감지되었습니다.")
+    hello()
