@@ -185,9 +185,9 @@ def interactive_select_live_left_only(cap, holds, window="D455"):
             h = holds[i]
             cv2.drawContours(vis, [h["_cnt"]], -1, (0,255,255), 3, cv2.LINE_AA)
             cx, cy = h["center"]
-            cv2.putText(vis, f"L{n}", (cx + 8, cy - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, .6, (0,0,0), 2, cv2.LINE_AA)
-            cv2.putText(vis, f"L{n}", (cx + 8, cy - 8),
+            cv2.putText(vis, f"L{n}", (int(cx) + 8, int(cy) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(vis, f"L{n}", (int(cx) + 8, int(cy) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, .6, (0,255,255), 1, cv2.LINE_AA)
 
         msg = "[Click] toggle (겹치면 순환)  |  [Space] finish  |  [R] reset  |  [Q/ESC] cancel"

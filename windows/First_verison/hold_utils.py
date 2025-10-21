@@ -54,9 +54,10 @@ def extract_holds_all_classes_no_index(frame_bgr, model, mask_thresh=0.7):
         color = COLOR_MAP.get(class_name, (255, 255, 255))
         M = cv2.moments(cnt)
         if M["m00"] == 0:
-            cx, cy = np.mean(cnt[:,0,0]), np.mean(cnt[:,0,1])
+            cx, cy = float(np.mean(cnt[:, 0, 0])), float(np.mean(cnt[:, 0, 1]))
         else:
-            cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
+            cx = float(M["m10"] / M["m00"])
+            cy = float(M["m01"] / M["m00"])
         out.append({
             "class_name": class_name,
             "color": color,
@@ -65,6 +66,8 @@ def extract_holds_all_classes_no_index(frame_bgr, model, mask_thresh=0.7):
             "conf": float(boxes.conf[i].item())
         })
     return out
+
+
 
 def initial_5frames_all_classes(cap, model, rotate_code, n_frames=5, mask_thresh=0.7, merge_dist_px=18):
     sets = []

@@ -22,6 +22,7 @@ from click_select import interactive_select_live_left_only
 from web import choose_color_via_web
 
 from realsense_adapter import RealSenseColorDepth
+# from realsense_filter import RealSenseColorDepth
 
 # ========= 사용자 환경 경로 =========
 MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\param\best_6.pt"
@@ -129,7 +130,7 @@ def _open_camera_and_model():
 
 def _parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM6")
+    ap.add_argument("--port", default="COM4")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--no_auto_advance", action="store_true")
     ap.add_argument("--no_web", action="store_true")
@@ -321,8 +322,10 @@ def _event_loop(size):
     blocked_state = {}
     out = None
     if SAVE_VIDEO:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(OUT_PATH, fourcc, OUT_FPS, (W, H))
+        out = cv2.VideoWriter(OUT_PATH,
+        cv2.VideoWriter_fourcc(*'mp4v')
+                              , OUT_FPS
+                              , (W, H))
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     t_prev = time.time()
     last_advanced_time = 0.0
@@ -655,7 +658,10 @@ def main():
         print("[Select] 선택 없음"); return
 
     holds = [holds[i] for i in idx]
-    holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
+    # 자동 정렬 코드 삭제
+    # holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
+    for new_id, h in enumerate(holds):
+        h["hold_index"] = new_id
     for h in holds:
         if "mask" not in h:
             h["mask"] = _mask_from_contour((proc_size[1], proc_size[0]), h["contour"])
@@ -691,6 +697,7 @@ def main():
 
     # (8) 모든 홀드 3D/각도 & 서보 타깃 생성(레이저 기준 적용)
     depth_m = cap.get_depth_meters()
+    depth_m = cv2.reszie(depth_m, (1280,720), interpolation=cv2.INTER_NEAREST)
     holds_3d = holds_to_3d(holds, depth_m, cap.deproject)
     matched_results = []
     for h in holds_3d:

@@ -21,7 +21,7 @@ profile = pipe.start(cfg)
 
 align = rs.align(rs.stream.color) if ALIGN_TO_COLOR else None
 depth_sensor = profile.get_device().first_depth_sensor()
-depth_scale = depth_sensor.get_depth_scale()  # depth_raw * depth_scale = meters
+depth_scale = round(depth_sensor.get_depth_scale(), 3)  # depth_raw * depth_scale = meters
 
 cv2.namedWindow('color', cv2.WINDOW_NORMAL)
 cv2.namedWindow('depth(aligned)', cv2.WINDOW_NORMAL)
@@ -37,6 +37,7 @@ cv2.setMouseCallback('color', on_mouse)
 t0, n = time.time(), 0
 try:
     while True:
+        print(f'depth = {depth_scale}')
         frames = pipe.wait_for_frames()
         if align:
             frames = align.process(frames)
