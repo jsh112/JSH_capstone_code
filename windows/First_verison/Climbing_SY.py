@@ -133,7 +133,7 @@ def _open_camera_and_model():
 
 def _parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM4")
+    ap.add_argument("--port", default="COM5")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--no_auto_advance", action="store_true")
     ap.add_argument("--no_web", action="store_true")
@@ -720,7 +720,9 @@ def main():
         print("[Select] 선택 없음"); return
 
     holds = [holds[i] for i in idx]
-    holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
+    # holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
+    for new_id, h in enumerate(holds):
+        h["hold_index"] = new_id
     for h in holds:
         if "mask" not in h:
             h["mask"] = _mask_from_contour((proc_size[1], proc_size[0]), h["contour"])
