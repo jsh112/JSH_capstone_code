@@ -23,7 +23,11 @@ from web import choose_color_via_web
 
 from realsense_adapter import RealSenseColorDepth
 
+# log, 지표관련 코드
+from A_LogUtils import log_laser_relation, save_occlusion_log
+
 # ========= 사용자 환경 경로 =========
+LOG_DIR        = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\First_version"
 MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\param\best_6.pt"
 
 SWAP_DISPLAY   = False   # 화면 표시 좌/우 스와프
@@ -133,7 +137,7 @@ def _open_camera_and_model():
 
 def _parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM5")
+    ap.add_argument("--port", default="COM4")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--no_auto_advance", action="store_true")
     ap.add_argument("--no_web", action="store_true")
@@ -467,8 +471,9 @@ def _run_frame_loop(cap, size, holds, matched_results,
     contact_start_ts = {}   # {(part, hold_id): 시작 시각}
     reported_350ms   = set()# 350ms 통과 후 이미 로그 출력한 키
     last_prog_print  = {}   # 진행 로그(스팸 방지용) 최근 출력 시각
-
     try:
+        # 통계로 쓸 리스트 추가
+        occlusion_logs = []
         while True:
             ok, Limg = cap.read()
             if not ok:
@@ -556,19 +561,39 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     )
                     is_block   = (label != "grip")
                     block_part = (who if is_block else None)
+                else:
+                    label, who = "none", "none"
 
                 if ADAPT_ALPHA > 0 and is_motion and not is_block:
                     base_f = base.astype(np.float32)
                     cv2.accumulateWeighted(patch.astype(np.float32), base_f, ADAPT_ALPHA, mask=mroi_core)
                     info["baseline"] = base_f.astype(np.uint8)
 
-                if is_block:
-                    part_to_report = block_part or "unknown"
-                    if part_to_report != getattr(_run_frame_loop, "_prev_block_part", None):
-                        print(f"[BLOCKED] 홀드 ID {current_target_id} — {part_to_report} 부위가 가림")
-                        _run_frame_loop._prev_block_part = part_to_report
-                else:
-                    _run_frame_loop._prev_block_part = None
+                # --- optional debug print ---
+                if label == "blocked":
+                    print(f"[BLOCKED] ID {current_target_id} — {who}")
+
+                # if is_block:
+                #     part_to_report = block_part or "unknown"
+                #     if part_to_report != getattr(_run_frame_loop, "_prev_block_part", None):
+                #         print(f"[BLOCKED] 홀드 ID {current_target_id} — {part_to_report} 부위가 가림")
+                #         _run_frame_loop._prev_block_part = part_to_report
+                # else:
+                #     _run_frame_loop._prev_block_part = None
+
+                # --- log every 5 frames ---
+                if frame_id % 5 == 0:
+                    from A_LogUtils import log_laser_relation
+                    log_laser_relation(
+                        occlusion_logs=occlusion_logs,
+                        frame_id=frame_id,
+                        hold_id=current_target_id,
+                        label=label,
+                        part=who,
+                        coords=coords,
+                        laser_px=laser_px,
+                        H=H
+                    )
 
             # 목표 (part, hold_id) 판정
             if coords and (current_target_id in holds_by_id):
@@ -591,7 +616,7 @@ def _run_frame_loop(cap, size, holds, matched_results,
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,140,255), 1, cv2.LINE_AA)
                     else:
                         x, y = coords[tpart]
-                        inside = cv2.pointPolygonTest(hold["contour"], (x, y), False) >= 0
+                        inside = cv2.pointPolygonTest(hold["contour"],(x, y), False) >= 0
                         key = (tpart, tid)
                         if inside:
                             current_touched.add(key)
@@ -606,9 +631,22 @@ def _run_frame_loop(cap, size, holds, matched_results,
                         now_t  = time.time()
                         if inside:
                             # 시작 시각 기록
+                            # '''
+                            # 다음 프레임에서 빠지면 바로 contact_start_ts가 삭제
                             if key_ts not in contact_start_ts:
                                 contact_start_ts[key_ts] = now_t
                             dur = now_t - contact_start_ts[key_ts]
+                            # '''
+
+                            '''
+                            10/21 15:58 -> “프레임 기반 지속 시간”으로 대체
+                            → 실제 시간 대신 touch_streak 카운트를 이용
+                            if inside:
+                                touch_streak[key] = touch_streak.get(key, 0) + 1
+                                dur = touch_streak[key] * (1000 / fps)
+                            else:
+                                touch_streak[key] = 0
+                            '''
 
                             # 진행 로그 (100ms 간격)
                             if dur < TOUCH_TIME_S_LOCAL and (now_t - last_prog_print.get(key_ts, 0)) > 0.10:
@@ -675,15 +713,24 @@ def _run_frame_loop(cap, size, holds, matched_results,
             frame_id += 1
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
+
     finally:
         cap.release()
         if SAVE_VIDEO and out is not None:
             out.release(); print(f"[Info] 저장 완료: {OUT_PATH}")
+        # 분석용 로그 추가
+        if occlusion_logs:
+            log_dir = globals().get("LOG_DIR", ".")
+            save_occlusion_log(occlusion_logs, log_dir)
         cv2.destroyAllWindows()
-        try: pose.close()
-        except: pass
-        try: ctl.close()
-        except: pass
+        try:
+            pose.close()
+        except:
+            pass
+        try:
+            ctl.close()
+        except:
+            pass
 
     return current_target_id, cur_yaw, cur_pitch
 
