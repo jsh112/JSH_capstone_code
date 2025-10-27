@@ -72,7 +72,7 @@ YAW_LASER0 = None
 PITCH_LASER0 = None
 
 K_EXTRA_PITCH_DEG = 1.0    # 최대 추가 피치 스케일(도)
-K_EXTRA_YAW_DEG = 1.5      # yaw 스케일
+K_EXTRA_YAW_DEG = 3.0     # yaw 스케일
 H0_MM       = 1500.0 # 높이 정규화(1 m)
 Z0_MM       = 4000.0 # 깊이 정규화(4 m에서 감쇠=1배)
 BETA_Z      = 1.2    # 깊이 감쇠 기울기(0이면 감쇠 없음)
@@ -179,7 +179,7 @@ def extra_pitch_deg(X, O, X_laser, y_up_is_negative=True):
 
 def extra_yaw_deg(X, O, X_laser, y_up_is_negative=True):
     """
-    위로 갈수록(=레이저 기준 Y보다 타깃 Y가 더 위일수록) 야우를 약간 가산.
+    위로 갈수록(=레이저 기준 Y보다 타깃 Y가 더 위일수록) yaw를 약간 가산.
     X: 홀드 3D(mm), O: 레이저 원점 3D(mm), X_laser: 첫 레이저 3D(mm)
     """
     if X is None or O is None or X_laser is None: 
@@ -512,10 +512,10 @@ def _run_frame_loop(cap, size, holds, matched_results,
             for mr in matched_results:
                 X = mr["X"]; depth = X[2]
                 txt3d = f"ID{mr['hid']} : X=({X[0]:.1f},{X[1]:.1f},{X[2]:.1f}) mm | depth(Z)={depth:.1f} mm"
-                cv2.putText(vis, txt3d, (20, y_info),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
-                cv2.putText(vis, txt3d, (20, y_info),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
+               # cv2.putText(vis, txt3d, (20, y_info),
+                 #           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
+                #cv2.putText(vis, txt3d, (20, y_info),
+                  #          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
                 y_info += 18
 
             # 포즈 추정
@@ -767,9 +767,9 @@ def main():
         print("[Select] 선택 없음"); return
 
     holds = [holds[i] for i in idx]
-    # holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
-    for new_id, h in enumerate(holds):
-        h["hold_index"] = new_id
+    holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
+    # for new_id, h in enumerate(holds):
+    #     h["hold_index"] = new_id
     for h in holds:
         if "mask" not in h:
             h["mask"] = _mask_from_contour((proc_size[1], proc_size[0]), h["contour"])
