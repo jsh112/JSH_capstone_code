@@ -23,6 +23,10 @@ from web import choose_color_via_web
 
 from realsense_adapter import RealSenseColorDepth
 
+# 머리랑 다음 홀드 위치 계산해서 가중치 준 이후 2차 이동하는 부분
+from head_view_bias import (HeadViewBias3DParams, compute_bias_angles_3d, head_center_from_coords, clamp)
+
+
 # ========= 사용자 환경 경로 =========
 MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\param\best_6.pt"
 
@@ -37,7 +41,7 @@ TOUCH_THRESHOLD = 1     # in-polygon 연속 프레임 임계(기본 10)
 ADV_COOLDOWN    = 0.5    # 연속 넘김 방지 쿨다운(sec)
 
 # ✅ 시간 기반 디버그 임계(초)
-TOUCH_TIME_S    = 0.150 
+TOUCH_TIME_S    = 0.150
 
 # 저장 옵션
 SAVE_VIDEO     = False
@@ -100,7 +104,7 @@ ROTATE_MAP = {
 }
 
 CAP_SIZE = (1280, 720)
-size = CAP_SIZE 
+size = CAP_SIZE
 # ======== Servo controller import (stub fallback) ========
 try:
     from servo_control import DualServoController
@@ -122,7 +126,7 @@ def rotate_image(img, rot_code):
 
 def rotate_point(pt, shape_hw, rot_code):
     """(x,y) 픽셀을 주어진 회전 코드로 변환. shape_hw는 '회전 전'의 (H,W)."""
-    if pt is None or rot_code is None: 
+    if pt is None or rot_code is None:
         return pt
     h, w = shape_hw
     x, y = int(pt[0]), int(pt[1])
@@ -141,7 +145,7 @@ def _open_camera_and_model():
 
 def _parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM5")
+    ap.add_argument("--port", default="COM4")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--no_auto_advance", action="store_true")
     ap.add_argument("--no_web", action="store_true")
@@ -313,10 +317,6 @@ def _mask_from_contour(shape_hw, contour, dilate_k=DILATE_KERNEL_SZ):
         m = cv2.dilate(m, ker, iterations=1)
     return m
 
-'''
-mediapipe 발 버퍼 추가
-'''
-
 def _foot_mask_from_coords(coords, shape_hw):
     H, W = shape_hw
     m = np.zeros((H, W), np.uint8)
@@ -392,7 +392,7 @@ def depth_median_at(depth_m, x, y, r=3):
     y0, y1 = max(0, y-r), min(h-1, y+r)
     patch = depth_m[y0:y1+1, x0:x1+1]
     vals = patch[(patch > 0) & np.isfinite(patch)]
-    if vals.size == 0: 
+    if vals.size == 0:
         return None
     return float(np.median(vals))
 
@@ -506,11 +506,13 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     out, t_prev, last_advanced_time, current_target_id, cur_yaw, cur_pitch, ctl,
                     route_pairs, route_pos, current_target_part,
                     hold_db, laser_px=None, yaw_laser0=0.0, pitch_laser0=0.0):
+
     W, H = size
     touch_streak = {}
     frame_id = 0
 
     holds_by_id = {h["hold_index"]: h for h in holds}
+    mr_by_id = {mr["hid"]: mr for mr in matched_results}  # ★ 추가: hid→matched_result
 
     # ===== 시간 기반 터치 트래킹/로깅 상태 =====
     TOUCH_TIME_S_LOCAL = globals().get("TOUCH_TIME_S", 0.350)  # 상단에 TOUCH_TIME_S 없으면 350ms 기본
@@ -519,8 +521,6 @@ def _run_frame_loop(cap, size, holds, matched_results,
     last_prog_print  = {}   # 진행 로그(스팸 방지용) 최근 출력 시각
 
     try:
-        # 통계로 쓸 리스트 추가
-        occlusion_logs = []
         while True:
             ok, Limg = cap.read()
             if not ok:
@@ -681,9 +681,6 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     cv2.putText(vis, f"[WARN] hold_id {tid} not present", (20, 46),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
                 else:
-                    '''
-                    10/29일 추가
-                    '''
                     # === (NEW) 손/발 그룹 후보 구성 ===
                     hand_set = getattr(pose, "hand_parts", set())
                     foot_set = getattr(pose, "foot_grip_parts", set())
@@ -774,6 +771,61 @@ def _run_frame_loop(cap, size, holds, matched_results,
                                     target_yaw, target_pitch = ty_tp
                                     send_servo_angles(ctl, target_yaw, target_pitch)
                                     cur_yaw, cur_pitch = target_yaw, target_pitch
+                                    # ===== 2차(3D) 보정: 머리-다음홀드 =====
+                                    # 1) 머리 픽셀 좌표 추출
+                                    head_xy_px = head_center_from_coords(coords)  # (u,v) or None
+
+                                    # 2) 다음 홀드 2D/3D 준비
+                                    hold_xy_px = holds_by_id[next_tid]["center"]  # (u,v)
+                                    mr = mr_by_id.get(next_tid)
+                                    hold_xyz_m = None
+                                    if mr is not None and ("X" in mr):
+                                        # matched_results의 X는 mm 기준 ndarray/tuple
+                                        X_mm = np.array(mr["X"], dtype=np.float64)
+                                        hold_xyz_m = (X_mm / 1000.0).astype(np.float64)  # (m)
+
+                                    # 3) 머리 3D 복원 (깊이에서 median 뽑아 역투영)
+                                    head_xyz_m = None
+                                    if head_xy_px is not None:
+                                        depth_m_full = cap.get_depth_meters()
+                                        hx, hy = int(round(head_xy_px[0])), int(round(head_xy_px[1]))
+                                        Z_head = depth_median_at(depth_m_full, hx, hy, r=3)  # (m)
+                                        # 이건 왜하는거지
+                                        if Z_head and Z_head > 0:
+                                            head_xyz_m = cap.deproject(hx, hy, Z_head)  # (m) float3
+
+                                    # 4) 가중 보정 각 계산 + 전송
+                                    if (head_xyz_m is not None) and (hold_xyz_m is not None):
+                                        # 목표까지 실제 거리 R(m). (레이저/카메라 오프셋 무시해도 소각에서는 충분)
+                                        R_m = float(np.linalg.norm(hold_xyz_m))
+
+                                        p3 = HeadViewBias3DParams(
+                                            # min_dist_m=0.10,  # 이 이하면 보정0
+                                            # max_dist_m=1.00,  # 이 이상이면 보정100%
+                                            # deadband_m=0.06,  # 떨림 무시
+                                            # max_offset_m=0.07,      # 7 cm (요구사항)
+                                            # max_angle_cap_deg=0.8,  # ★ 절대 0.8° 넘지 않게
+                                            # gamma=1.2,
+                                            # reverse_direction=True, # 홀드가 위면 레이저는 아래로 (반대방향)
+                                        )
+
+                                        dyaw_w, dpitch_w, info = compute_bias_angles_3d(
+                                            head_xyz_m, hold_xyz_m, hold_range_m=R_m,
+                                            head_xy_px=head_xy_px, hold_xy_px=hold_xy_px,
+                                            params=p3
+                                        )
+
+                                        # world→서보 각으로 변환해 2차 전송
+                                        yaw2   = clamp(target_yaw   + YAW_SIGN * YAW_SCALE   * dyaw_w,   0.0, 180.0)
+                                        pitch2 = clamp(target_pitch + PITCH_SIGN * PITCH_SCALE * dpitch_w, 0.0, 180.0)
+
+                                        time.sleep(2.0)  # ★ 1차 이동 후 계산 끝내고 2차 이동 전에 대기시키기
+                                        if (abs(yaw2 - target_yaw) > 1e-3) or (abs(pitch2 - target_pitch) > 1e-3):
+                                            send_servo_angles(ctl, yaw2, pitch2)
+                                            print(f"[HeadBias3D] sector={info['sector']} d3={info['dist_m']:.2f}m R={R_m:.2f}m "
+                                                f"θmax={info['theta_max_deg']:.2f}° w={info['weight']:.2f}  "
+                                                f"Δyaw={dyaw_w:+.3f}° Δpitch={dpitch_w:+.3f}°")
+                                    # ===== 보정 끝 =====
                                     route_pos += 1
                                     current_target_id   = next_tid
                                     current_target_part = next_part
@@ -812,15 +864,6 @@ def _run_frame_loop(cap, size, holds, matched_results,
         cap.release()
         if SAVE_VIDEO and out is not None:
             out.release(); print(f"[Info] 저장 완료: {OUT_PATH}")
-        # 분석용 로그 추가
-        if occlusion_logs:
-            import pandas as pd
-            import datetime
-            timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_name = f"metric_occlusion_log_{timestamp_str}.csv"
-            pd.DataFrame(occlusion_logs).to_csv(log_name, index=False)
-            print(f"[Metric] Occlusion log saved: {log_name} ({len(occlusion_logs)} entries)")
-            print(f"[Metric] Occlusion log saved ({len(occlusion_logs)} entries)")
         cv2.destroyAllWindows()
         try: pose.close()
         except: pass
