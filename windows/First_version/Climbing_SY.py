@@ -72,12 +72,18 @@ YAW_LASER0 = None
 PITCH_LASER0 = None
 
 K_EXTRA_PITCH_DEG = 1.0    # 최대 추가 피치 스케일(도)
-K_EXTRA_YAW_DEG = 3.0     # yaw 스케일
-H0_MM       = 1500.0 # 높이 정규화(1 m)
+K_EXTRA_YAW_DEG = -1.0     # yaw 스케일
+H0_MM       = 1400.0 # 높이 정규화(1 m)
 Z0_MM       = 4000.0 # 깊이 정규화(4 m에서 감쇠=1배)
 BETA_Z      = 1.2    # 깊이 감쇠 기울기(0이면 감쇠 없음)
-H_SOFT_MM  = 160.0   # 높이차가 이 정도 이하일 때 가산을 살짝 눌러줌
+H_SOFT_MM  = 140.0   # 높이차가 이 정도 이하일 때 가산을 살짝 눌러줌
 GAMMA_H    = 0.1     # 1.0~1.5 권장 (커지면 초반 더 세게 눌림)
+
+# --- 좌/우(레이저 기준 X) 가산 파라미터 ---
+X0_MM        = 1200.0   # 좌우 정규화 스케일(1 m)
+X_SOFT_MM    = 120.0    # 초기 구간 소프트 스타트 완화 폭
+GAMMA_X      = 0.2      # 소프트 스타트 기울기(0.1~0.5 권장)
+X_DEADBAND_MM= 25.0     # 레이저와 거의 같은 X일 때(±deadband) 가산 0
 
 # === 이미지 차분 파라미터 ===
 DIFF_EVERY_N     = 3      # N프레임마다 차분(=부하 감소)
@@ -179,30 +185,41 @@ def extra_pitch_deg(X, O, X_laser, y_up_is_negative=True):
 
 def extra_yaw_deg(X, O, X_laser, y_up_is_negative=True):
     """
-    위로 갈수록(=레이저 기준 Y보다 타깃 Y가 더 위일수록) yaw를 약간 가산.
-    X: 홀드 3D(mm), O: 레이저 원점 3D(mm), X_laser: 첫 레이저 3D(mm)
+    레이저 기준 X(좌/우)만으로 yaw에 가산을 준다.
+    - 목표가 레이저보다 '오른쪽'(dx>0)이면 +방향 가산
+    - '왼쪽'(dx<0)이면 -방향 가산
+    - 레이저와 거의 같은 X(±X_DEADBAND_MM)이면 0
+    - 멀수록(깊이 차↑) 감쇠(BETA_Z, Z0_MM)
     """
-    if X is None or O is None or X_laser is None: 
+    if X is None or O is None or X_laser is None:
         return 0.0
 
-    # --- 높이 차 h(mm): '위' 방향이 -y면 부호 뒤집기 동일
-    Yh = float(X[1]); Y0 = float(X_laser[1])
-    h = (Y0 - Yh) if y_up_is_negative else (Yh - Y0)
-    if h <= 0:               # 레이저보다 낮으면 가산 없음
+    # --- 좌/우 오프셋(mm): +면 목표가 레이저보다 오른쪽 ---
+    dx = float(X[0]) - float(X_laser[0])
+
+    # --- 데드밴드: 거의 같은 X면 가산 0 ---
+    if abs(dx) <= X_DEADBAND_MM:
         return 0.0
 
-    # --- 깊이(Z) 감쇠: 멀수록(=Z 차↑) 덜 가산
+    # 데드밴드 이후의 유효 거리
+    dx_eff = abs(dx) - X_DEADBAND_MM
+
+    # --- 소프트 스타트(초반 과보정 방지) ---
+    soft_x = (dx_eff / (dx_eff + X_SOFT_MM)) ** GAMMA_X
+
+    # 좌/우 정규화 항(거리 커질수록 가중↑)
+    lateral_term = (dx_eff / max(1.0, X0_MM)) * soft_x
+
+    # --- 깊이(Z) 감쇠: 멀수록 덜 가산 ---
     Zh = float(X[2]); Z0 = float(O[2])
     z_depth = max(1.0, abs(Zh - Z0))
+    depth_term = (Z0_MM / z_depth) ** BETA_Z
 
-    # --- 소프트 스타트(초반 과보정 방지)
-    soft_h = (h / (h + H_SOFT_MM)) ** GAMMA_H
+    # 부호: 오른쪽(+), 왼쪽(-)
+    sgn = 1.0 if dx > 0 else -1.0
 
-    height_term = (h / max(1.0, H0_MM)) * soft_h
-    depth_term  = (Z0_MM / z_depth) ** BETA_Z
-
-    return K_EXTRA_YAW_DEG * height_term * depth_term   # 부호는 K_EXTRA_YAW_DEG로 결정
-
+    # 최종 가산(deg). K_EXTRA_YAW_DEG 부호/크기는 현장에서 튜닝
+    return sgn * K_EXTRA_YAW_DEG * lateral_term * depth_term
 
 def depth_median_in_mask(depth_m, mask):
     ys, xs = np.where(mask > 0)
@@ -719,9 +736,9 @@ def _run_frame_loop(cap, size, holds, matched_results,
         if SAVE_VIDEO and out is not None:
             out.release(); print(f"[Info] 저장 완료: {OUT_PATH}")
         # 분석용 로그 추가
-        if occlusion_logs:
-            log_dir = globals().get("LOG_DIR", ".")
-            save_occlusion_log(occlusion_logs, log_dir)
+        # if occlusion_logs:
+        #     log_dir = globals().get("LOG_DIR", ".")
+        #     save_occlusion_log(occlusion_logs, log_dir)
         cv2.destroyAllWindows()
         try:
             pose.close()
