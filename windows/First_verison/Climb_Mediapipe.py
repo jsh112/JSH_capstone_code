@@ -168,14 +168,13 @@ def build_body_masks(coords, shape_hw):
     """
     coords: PoseTracker.process가 반환한 dict{name:(x,y)}
     shape_hw: (H, W)
-    return: torso_mask(uint8), limb_masks(dict[name->uint8]), handsfeet_mask(uint8)
+    return: torso_mask(uint8), limb_masks(dict[name->uint8]), handsfeet_mask(uint8), head_mask(uint8)
     """
     H, W = shape_hw
     def has(*names): return all(n in coords for n in names)
 
     torso = np.zeros((H, W), np.uint8)
     limbs = {}  # name -> mask
-    hands_feet = np.zeros((H, W), np.uint8)
 
     # --- Torso: 확장 사변형 + 척추 캡슐 ---
     if has("left_shoulder","right_shoulder","left_hip","right_hip"):
@@ -226,74 +225,87 @@ def build_body_masks(coords, shape_hw):
     limb_capsule("left_shin",       "left_knee",     "left_ankle", 0.18)
     limb_capsule("right_shin",      "right_knee",    "right_ankle",0.18)
 
-    # 손/발  — 작은 원
+    # --- 손/발 마스크 구성: 손=원, 발=캡슐(heel↔foot_index) ---
+    hands_only = np.zeros((H, W), np.uint8)
     for n in ("left_wrist","right_wrist",
-          "left_index","right_index","left_thumb","right_thumb","left_pinky","right_pinky",
-          "left_heel","right_heel", "left_foot_index","right_foot_index"):
+              "left_index","right_index","left_thumb","right_thumb","left_pinky","right_pinky"):
         if n in coords:
             x,y = map(int, map(round, coords[n]))
-            cv2.circle(hands_feet, (x,y), 16, 255, -1, cv2.LINE_AA)
+            cv2.circle(hands_only, (x,y), 16, 255, -1, cv2.LINE_AA)
 
-    head = head_mask_from_coords(coords, shape_hw)  # 없으면 None 반환
+    foot_mask = np.zeros((H, W), np.uint8)
+
+    def draw_foot(heel_name, index_name):
+        if has(heel_name, index_name):
+            A = np.array(coords[heel_name], dtype=float)
+            B = np.array(coords[index_name], dtype=float)
+            L = np.linalg.norm(B - A)
+            # 길이 비례 반경(필요시 상수로도 OK: ex. r=16)
+            r = max(12.0, 0.22 * L)
+            _draw_capsule(foot_mask, A, B, r)
+
+    draw_foot("left_heel",  "left_foot_index")
+    draw_foot("right_heel", "right_foot_index")
+
+    # 손+발 통합
+    hands_feet = cv2.bitwise_or(hands_only, foot_mask)
+
+    head = head_mask_from_coords(coords, shape_hw)
     if head is None:
         head = np.zeros((H, W), np.uint8)
 
     return torso, limbs, hands_feet, head
 
-def classify_occluder(center_xy, coords, shape_hw, grip_parts=None, hold_mask=None):
-    """
-    center_xy: (cx,cy) 홀드 중심 (사용자/호출부가 여전히 전달)
-    coords: PoseTracker.process 결과
-    shape_hw: (H,W)
-    hand_parts, blocking_parts: 기존 호출 안전성(호환성 유지용, 내부에서 사용 안해도 됨)
-    hold_mask: (H,W) uint8 mask of the hold (optional). 제공되면 홀드 내부와 손/발 마스크의 overlap으로 grip 판정.
-    return: (label, part_name)
-      - ("grip", "hand/foot" or specific part)
-      - ("blocked", "<limb_name|torso|head|<joint_name>|unknown>")
-    """
+def classify_occluder(center_xy, coords, hold_mask=None, shape_hw=None):
+    # shape_hw가 없으면 hold_mask에서 추론
+    if shape_hw is None:
+        if hold_mask is not None:
+            shape_hw = hold_mask.shape[:2]
+        else:
+            raise ValueError("shape_hw 또는 hold_mask 중 하나는 필요합니다.")
+
+    # 필요 마스크 4개만 쓰면 됨(발은 hands_feet에 이미 포함)
+    torso_m, limb_ms, handsfeet_m, head_m = build_body_masks(coords, shape_hw)
+
+    # 1) 홀드∩손/발 겹치면 grip 우선
+    if hold_mask is not None:
+        overlap_any = cv2.bitwise_and(handsfeet_m, hold_mask)
+        if np.count_nonzero(overlap_any) > 0:
+            return ("grip", "hand/foot")
+
+    # 2) head / limb / torso 차단
     H, W = shape_hw
     cx, cy = map(int, map(round, center_xy))
     cx = max(0, min(W-1, cx)); cy = max(0, min(H-1, cy))
-
-    torso_m, limb_ms, handsfeet_m, head_m = build_body_masks(coords, (H, W))
-
-    # 1) 홀드 마스크가 주어지면 '홀드 내부와 손/발 마스크의 교차'를 우선으로 판정
-    if hold_mask is not None:
-        # hold_mask이 이미 (H,W)라면 그대로, 아니면 예상되는 crop 대응은 호출부에서 처리
-        overlap = cv2.bitwise_and(handsfeet_m, hold_mask)
-        if np.count_nonzero(overlap) > 0:
-            # 어느 손/발이 겹쳤는지 근접관절로 탐색해 리턴하면 더 좋음
-            # 간단히 "hand/foot"로 표기
-            return ("grip", "hand/foot")
-
-    # 2) head / limb / torso 마스크 기반 검사 (홀드 마스크가 없어도 작동)
     if head_m[cy, cx] > 0:
         return ("blocked", "head")
-
     for lname, m in limb_ms.items():
         if m[cy, cx] > 0:
             return ("blocked", lname)
-
     if torso_m[cy, cx] > 0:
         return ("blocked", "torso")
 
-    # 3) 폴백: 가장 가까운 관절 (단, hand_parts는 grip 후보에서 제외)
-    names = list(coords.keys())
-    if grip_parts:
-        names = [n for n in names if n not in grip_parts]
-    best_name, best_d2 = None, 1e18
-    for n in names:
+    # 3) 폴백: grip 파트 제외한 가장 가까운 관절
+    GRIP_PARTS = {
+        # 손
+        "left_wrist","right_wrist","left_index","right_index",
+        "left_thumb","right_thumb","left_pinky","right_pinky",
+        # 발
+        "left_heel","right_heel","left_foot_index","right_foot_index",
+    }
+    cand = [n for n in coords.keys() if n not in GRIP_PARTS]
+    best, best_d2 = None, 1e18
+    for n in cand:
         x,y = coords[n]
         d2 = (x-cx)*(x-cx) + (y-cy)*(y-cy)
         if d2 < best_d2:
-            best_d2, best_name = d2, n
+            best_d2, best = d2, n
 
     HEAD_KEYS = {
-        "nose",
-        "left_eye_inner","left_eye","left_eye_outer",
+        "nose","left_eye_inner","left_eye","left_eye_outer",
         "right_eye_inner","right_eye","right_eye_outer",
         "left_ear","right_ear","mouth_left","mouth_right",
     }
-    if best_name in HEAD_KEYS:
+    if best in HEAD_KEYS:
         return ("blocked", "head")
-    return ("blocked", best_name if best_name is not None else "unknown")
+    return ("blocked", best or "unknown")

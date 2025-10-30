@@ -22,7 +22,6 @@ from click_select import interactive_select_live_left_only
 from web import choose_color_via_web
 
 from realsense_adapter import RealSenseColorDepth
-# from realsense_filter import RealSenseColorDepth
 
 # ========= 사용자 환경 경로 =========
 MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\param\best_6.pt"
@@ -31,11 +30,14 @@ SWAP_DISPLAY   = False   # 화면 표시 좌/우 스와프
 
 WINDOW_NAME    = "Rectified L | R"
 THRESH_MASK    = 0.7
-ROW_TOL_Y      = 45
+ROW_TOL_Y      = 10
 
 # 자동 진행(터치→다음 홀드) 관련
 TOUCH_THRESHOLD = 1     # in-polygon 연속 프레임 임계(기본 10)
 ADV_COOLDOWN    = 0.5    # 연속 넘김 방지 쿨다운(sec)
+
+# ✅ 시간 기반 디버그 임계(초)
+TOUCH_TIME_S    = 0.150 
 
 # 저장 옵션
 SAVE_VIDEO     = False
@@ -48,9 +50,9 @@ CAL_YAW_OFFSET   = 0.0
 CAL_PITCH_OFFSET = 0.0
 
 # ---- 레이저 원점(LEFT 기준) 오프셋 (cm) ----
-LASER_OFFSET_CM_LEFT = 1.15
-LASER_OFFSET_CM_UP   = 5.2
-LASER_OFFSET_CM_FWD  = -0.6
+LASER_OFFSET_CM_LEFT = 2.5
+LASER_OFFSET_CM_UP   = 7.3
+LASER_OFFSET_CM_FWD  = -8.0
 Y_UP_IS_NEGATIVE     = True  # 위 방향이 -y인 좌표계면 True
 
 # === 서보 기준(중립 90/90) & 부호/스케일 ===
@@ -65,12 +67,21 @@ PITCH_SCALE    = 1.0
 YAW_LASER0 = None
 PITCH_LASER0 = None
 
-K_EXTRA_DEG = 0.0    # 최대 추가 피치 스케일(도)
-H0_MM       = 1500.0 # 높이 정규화(1 m)
+K_EXTRA_PITCH_DEG = 1.0    # 최대 추가 피치 스케일(도)
+K_EXTRA_YAW_DEG = -1.0      # yaw 스케일
+
+# 높이 차이 기반 가산 파라미터
+H0_MM       = 1400.0 # 높이 정규화(1 m)
 Z0_MM       = 4000.0 # 깊이 정규화(4 m에서 감쇠=1배)
 BETA_Z      = 1.2    # 깊이 감쇠 기울기(0이면 감쇠 없음)
 H_SOFT_MM  = 160.0   # 높이차가 이 정도 이하일 때 가산을 살짝 눌러줌
 GAMMA_H    = 0.1     # 1.0~1.5 권장 (커지면 초반 더 세게 눌림)
+
+# --- 좌/우(레이저 기준 X) 가산 파라미터 ---
+X0_MM        = 1200.0   # 좌우 정규화 스케일(1 m)
+X_SOFT_MM    = 120.0    # 초기 구간 소프트 스타트 완화 폭
+GAMMA_X      = 0.2      # 소프트 스타트 기울기(0.1~0.5 권장)
+X_DEADBAND_MM= 25.0     # 레이저와 거의 같은 X일 때(±deadband) 가산 0
 
 # === 이미지 차분 파라미터 ===
 DIFF_EVERY_N     = 3      # N프레임마다 차분(=부하 감소)
@@ -168,7 +179,47 @@ def extra_pitch_deg(X, O, X_laser, y_up_is_negative=True):
     height_term = (h / max(1.0, H0_MM)) * soft_h
     depth_term  = (Z0_MM / z_depth) ** BETA_Z
 
-    return K_EXTRA_DEG * height_term * depth_term
+    return K_EXTRA_PITCH_DEG * height_term * depth_term
+
+def extra_yaw_deg(X, O, X_laser, y_up_is_negative=True):
+    """
+    레이저 기준 X(좌/우)만으로 yaw에 가산을 준다.
+    - 목표가 레이저보다 '오른쪽'(dx>0)이면 +방향 가산
+    - '왼쪽'(dx<0)이면 -방향 가산
+    - 레이저와 거의 같은 X(±X_DEADBAND_MM)이면 0
+    - 멀수록(깊이 차↑) 감쇠(BETA_Z, Z0_MM)
+    """
+    if X is None or O is None or X_laser is None:
+        return 0.0
+
+    # --- 좌/우 오프셋(mm): +면 목표가 레이저보다 오른쪽 ---
+    dx = float(X[0]) - float(X_laser[0])
+
+    # --- 데드밴드: 거의 같은 X면 가산 0 ---
+    if abs(dx) <= X_DEADBAND_MM:
+        return 0.0
+
+    # 데드밴드 이후의 유효 거리
+    dx_eff = abs(dx) - X_DEADBAND_MM
+
+    # --- 소프트 스타트(초반 과보정 방지) ---
+    soft_x = (dx_eff / (dx_eff + X_SOFT_MM)) ** GAMMA_X
+
+    # 좌/우 정규화 항(거리 커질수록 가중↑)
+    lateral_term = (dx_eff / max(1.0, X0_MM)) * soft_x
+
+    # --- 깊이(Z) 감쇠: 멀수록 덜 가산 ---
+    Zh = float(X[2]); Z0 = float(O[2])
+    z_depth = max(1.0, abs(Zh - Z0))
+    depth_term = (Z0_MM / z_depth) ** BETA_Z
+
+    # 부호: 오른쪽(+), 왼쪽(-)
+    sgn = 1.0 if dx > 0 else -1.0
+
+    # 최종 가산(deg). K_EXTRA_YAW_DEG 부호/크기는 현장에서 튜닝
+    return sgn * K_EXTRA_YAW_DEG * lateral_term * depth_term
+
+
 
 def depth_median_in_mask(depth_m, mask):
     ys, xs = np.where(mask > 0)
@@ -262,6 +313,31 @@ def _mask_from_contour(shape_hw, contour, dilate_k=DILATE_KERNEL_SZ):
         m = cv2.dilate(m, ker, iterations=1)
     return m
 
+def _foot_mask_from_coords(coords, shape_hw):
+    H, W = shape_hw
+    m = np.zeros((H, W), np.uint8)
+
+    def _draw_capsule_local(mask, p1, p2, radius_px):
+        p1 = tuple(map(int, map(round, p1)))
+        p2 = tuple(map(int, map(round, p2)))
+        r  = int(round(float(radius_px)))
+        if r <= 0: return
+        cv2.line(mask, p1, p2, 255, thickness=2*r, lineType=cv2.LINE_AA)
+        cv2.circle(mask, p1, r, 255, -1, cv2.LINE_AA)
+        cv2.circle(mask, p2, r, 255, -1, cv2.LINE_AA)
+
+    def _draw_foot(heel_name, index_name):
+        if heel_name in coords and index_name in coords:
+            A = np.array(coords[heel_name], dtype=float)
+            B = np.array(coords[index_name], dtype=float)
+            L = np.linalg.norm(B - A)
+            r = max(12.0, 0.22 * L)   # 필요시 튜닝: 0.18~0.28
+            _draw_capsule_local(m, A, B, r)
+
+    _draw_foot("left_heel",  "left_foot_index")
+    _draw_foot("right_heel", "right_foot_index")
+    return m
+
 def _build_hold_db_with_baseline(cap, size, holds, n_frames=10, diff_gate=12.0):
     W, H = size
     db = {}
@@ -321,11 +397,10 @@ def _event_loop(size):
     pose = PoseTracker(min_detection_confidence=0.5, model_complexity=1)
     blocked_state = {}
     out = None
+
     if SAVE_VIDEO:
-        out = cv2.VideoWriter(OUT_PATH,
-        cv2.VideoWriter_fourcc(*'mp4v')
-                              , OUT_FPS
-                              , (W, H))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(OUT_PATH, fourcc, OUT_FPS, (W, H))
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     t_prev = time.time()
     last_advanced_time = 0.0
@@ -362,6 +437,7 @@ def build_servo_targets(by_id, yaw_laser0, pitch_laser0, X_laser, O):
 
         # ★ Pitch만 Z깊이 감쇠로 가중치 적용
         tp += extra_pitch_deg(mr.get("X"), O, X_laser, y_up_is_negative=Y_UP_IS_NEGATIVE)
+        ty += extra_yaw_deg(mr.get("X"), O, X_laser, y_up_is_negative=Y_UP_IS_NEGATIVE)
 
         ty = max(0.0, min(180.0, ty))
         tp = max(0.0, min(180.0, tp))
@@ -432,7 +508,15 @@ def _run_frame_loop(cap, size, holds, matched_results,
 
     holds_by_id = {h["hold_index"]: h for h in holds}
 
+    # ===== 시간 기반 터치 트래킹/로깅 상태 =====
+    TOUCH_TIME_S_LOCAL = globals().get("TOUCH_TIME_S", 0.350)  # 상단에 TOUCH_TIME_S 없으면 350ms 기본
+    contact_start_ts = {}   # {(part, hold_id): 시작 시각}
+    reported_350ms   = set()# 350ms 통과 후 이미 로그 출력한 키
+    last_prog_print  = {}   # 진행 로그(스팸 방지용) 최근 출력 시각
+
     try:
+        # 통계로 쓸 리스트 추가
+        occlusion_logs = []
         while True:
             ok, Limg = cap.read()
             if not ok:
@@ -481,6 +565,36 @@ def _run_frame_loop(cap, size, holds, matched_results,
             coords = pose.process(Limg)
             draw_pose_points(vis, coords, offset_x=0)
 
+            if coords:
+                H_, W_ = vis.shape[:2]
+                foot_mask = np.zeros((H_, W_), np.uint8)
+
+                def _draw_capsule(mask, p1, p2, r):
+                    # 선 두께를 2r로 그리면 내부가 채워진 캡슐이 됨
+                    cv2.line(mask, p1, p2, 255, thickness=2*r, lineType=cv2.LINE_AA)
+                    cv2.circle(mask, p1, r, 255, -1, cv2.LINE_AA)
+                    cv2.circle(mask, p2, r, 255, -1, cv2.LINE_AA)
+
+                for heel_name, index_name in [("left_heel","left_foot_index"),
+                                            ("right_heel","right_foot_index")]:
+                    if heel_name in coords and index_name in coords:
+                        Ax, Ay = map(lambda v: int(round(v)), coords[heel_name])
+                        Bx, By = map(lambda v: int(round(v)), coords[index_name])
+                        L = float(np.hypot(Bx - Ax, By - Ay))
+                        r = max(12, int(round(0.22 * L)))
+                        _draw_capsule(foot_mask, (Ax, Ay), (Bx, By), r)
+
+                if np.count_nonzero(foot_mask) > 0:
+                    # 반투명 채움
+                    overlay = vis.copy()
+                    overlay[foot_mask > 0] = (0, 255, 255)  # 노란색
+                    cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
+
+                    # 외곽선
+                    cnts, _ = cv2.findContours(foot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if cnts:
+                        cv2.drawContours(vis, cnts, -1, (0, 255, 255), 2, cv2.LINE_AA)
+
             # 타깃 홀드 이미지 차분
             if frame_id % DIFF_EVERY_N == 0 and current_target_id in hold_db:
                 info = hold_db[current_target_id]
@@ -514,9 +628,7 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     label, who = classify_occluder(
                         center_xy=info["center"],
                         coords=coords,
-                        shape_hw=(H, W),
-                        grip_parts=pose.grip_parts,
-                        hold_mask=info.get("mask", None)
+                        hold_mask=info.get("mask")
                     )
                     is_block   = (label != "grip")
                     block_part = (who if is_block else None)
@@ -531,7 +643,24 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     if part_to_report != getattr(_run_frame_loop, "_prev_block_part", None):
                         print(f"[BLOCKED] 홀드 ID {current_target_id} — {part_to_report} 부위가 가림")
                         _run_frame_loop._prev_block_part = part_to_report
+                        # === [지표2 로깅 추가] ===
+                        occlusion_logs.append({
+                            "frame_id": frame_id,
+                            "timestamp": time.time(),
+                            "hold_id": current_target_id,
+                            "blocked_part": part_to_report,
+                            "label": label,  # 'grip' or 'blocked'
+                        })
                 else:
+                    # [NEW] grip 상태도 일정 간격으로 기록 (데이터 폭 방지용)
+                    if frame_id % 5 == 0:  # 20FPS 기준 약 4Hz 샘플링
+                        occlusion_logs.append({
+                            "frame_id": frame_id,
+                            "timestamp": time.time(),
+                            "hold_id": current_target_id,
+                            "blocked_part": "none",
+                            "label": "grip",
+                        })
                     _run_frame_loop._prev_block_part = None
 
             # 목표 (part, hold_id) 판정
@@ -545,32 +674,85 @@ def _run_frame_loop(cap, size, holds, matched_results,
                 tpart = _resolve_part_name(tpart_csv, coords, getattr(pose, "grip_parts", set()))
 
                 if hold is None:
-                    cv2.putText(vis, f"[WARN] hold_id {tid} not present", (20, 64),
+                    cv2.putText(vis, f"[WARN] hold_id {tid} not present", (20, 46),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
                 else:
-                    if tpart is None:
-                        cv2.putText(vis, f"[WARN] part '{tpart_csv}' not in coords", (20, 46),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
-                        cv2.putText(vis, f"[WARN] part '{tpart_csv}' not in coords", (20, 46),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,140,255), 1, cv2.LINE_AA)
-                    else:
-                        x, y = coords[tpart]
-                        inside = cv2.pointPolygonTest(hold["contour"], (x, y), False) >= 0
-                        key = (tpart, tid)
-                        if inside:
-                            current_touched.add(key)
-                        if inside and (tpart in pose.blocking_parts):
-                            if not blocked_state.get(key, False):
-                                blocked_state[key] = True
-                        else:
-                            blocked_state[key] = False
+                    # === (NEW) 손/발 그룹 후보 구성 ===
+                    hand_set = getattr(pose, "hand_parts", set())
+                    foot_set = getattr(pose, "foot_grip_parts", set())
 
-                    cnt = touch_streak.get((tpart or tpart_csv, tid), 0)
-                    cv2.putText(vis, f"[GRIP] {tpart or tpart_csv}@{tid} {cnt}/{TOUCH_THRESHOLD}",
+                    csv_wants_hand = (tpart_csv in {"hand", "any_hand"})
+                    csv_wants_foot = (tpart_csv in {"foot", "any_foot"})
+
+                    is_hand_part = (tpart in hand_set)
+                    is_foot_part = (tpart in foot_set)
+
+                    if csv_wants_foot or is_foot_part:
+                        group_label = "foot"
+                        touched_any = False
+
+                        # ★ 발은 마스크↔마스크 겹침으로 판정
+                        foot_m = _foot_mask_from_coords(coords, (H, W))
+                        info = hold_db.get(tid)
+                        if info is not None:
+                            hold_m = info.get("mask")
+                            if hold_m is not None:
+                                overlap = cv2.bitwise_and(foot_m, hold_m)
+                                if np.count_nonzero(overlap) > 0:
+                                    touched_any = True
+
+                        display_key = (group_label, tid)
+
+                    else:
+                        # hand 또는 특정 파트는 기존처럼 포인트 in-polygon
+                        if csv_wants_hand or is_hand_part:
+                            candidate_parts = [n for n in hand_set if n in coords]
+                            group_label = "hand"
+                        else:
+                            candidate_parts = [tpart] if (tpart in coords) else []
+                            group_label = (tpart or tpart_csv)
+
+                        display_key = (group_label, tid)
+                        touched_any = False
+                        for pname in candidate_parts:
+                            x, y = coords[pname]
+                            if cv2.pointPolygonTest(hold["contour"], (x, y), False) >= 0:
+                                touched_any = True
+                                break
+
+                    # (공통) 그룹 키 기반 current_touched 설정
+                    current_touched = set()
+                    if touched_any:
+                        current_touched.add(display_key)
+
+                    # ===== 시간 기반 카운트/로그 갱신 (display_key 사용) =====
+                    key_ts = display_key  # 시간 누적도 그룹 단위로
+                    now_t  = time.time()
+                    if touched_any:
+                        if key_ts not in contact_start_ts:
+                            contact_start_ts[key_ts] = now_t
+                        dur = now_t - contact_start_ts[key_ts]
+
+                        if dur < TOUCH_TIME_S_LOCAL and (now_t - last_prog_print.get(key_ts, 0)) > 0.10:
+                            print(f"[DBG] touching {key_ts[0]}@{key_ts[1]}  {dur*1000:.0f}ms / {TOUCH_TIME_S_LOCAL*1000:.0f}ms")
+                            last_prog_print[key_ts] = now_t
+
+                        if dur >= TOUCH_TIME_S_LOCAL and key_ts not in reported_350ms:
+                            print(f"[GRIP-350ms] confirmed: {key_ts[0]}@{key_ts[1]}  ({dur*1000:.0f} ms)")
+                            reported_350ms.add(key_ts)
+                    else:
+                        contact_start_ts.pop(key_ts, None)
+                        last_prog_print.pop(key_ts, None)
+                        reported_350ms.discard(key_ts)
+
+                    # HUD도 그룹 라벨로
+                    cnt = touch_streak.get(display_key, 0)
+                    cv2.putText(vis, f"[GRIP] {group_label}@{tid} {cnt}/{TOUCH_THRESHOLD}",
                                 (20, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,0), 3, cv2.LINE_AA)
-                    cv2.putText(vis, f"[GRIP] {tpart or tpart_csv}@{tid} {cnt}/{TOUCH_THRESHOLD}",
+                    cv2.putText(vis, f"[GRIP] {group_label}@{tid} {cnt}/{TOUCH_THRESHOLD}",
                                 (20, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (50,220,50), 2, cv2.LINE_AA)
 
+                    # 프레임 단위 카운트 누적/초기화
                     for key in current_touched:
                         touch_streak[key] = touch_streak.get(key, 0) + 1
                         if touch_streak[key] >= TOUCH_THRESHOLD:
@@ -592,9 +774,13 @@ def _run_frame_loop(cap, size, holds, matched_results,
                                     advanced_this_frame = True
                                     touch_streak.clear()
                                     break
+
+                    # 그룹 키가 아닌 것은 0으로
                     for key in list(touch_streak.keys()):
-                        if key not in current_touched:
-                            touch_streak[key] = 0
+                        if key != display_key:
+                            # 다른 키는 이번 프레임에 터치가 없으면 0으로
+                            if key not in current_touched:
+                                touch_streak[key] = 0
 
             # FPS/HUD
             t_now = time.time()
@@ -614,10 +800,20 @@ def _run_frame_loop(cap, size, holds, matched_results,
             frame_id += 1
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
+
     finally:
         cap.release()
         if SAVE_VIDEO and out is not None:
             out.release(); print(f"[Info] 저장 완료: {OUT_PATH}")
+        # 분석용 로그 추가
+        if occlusion_logs:
+            import pandas as pd
+            import datetime
+            timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_name = f"metric_occlusion_log_{timestamp_str}.csv"
+            pd.DataFrame(occlusion_logs).to_csv(log_name, index=False)
+            print(f"[Metric] Occlusion log saved: {log_name} ({len(occlusion_logs)} entries)")
+            print(f"[Metric] Occlusion log saved ({len(occlusion_logs)} entries)")
         cv2.destroyAllWindows()
         try: pose.close()
         except: pass
@@ -625,6 +821,7 @@ def _run_frame_loop(cap, size, holds, matched_results,
         except: pass
 
     return current_target_id, cur_yaw, cur_pitch
+
 
 def main():
     args = _parse_args()
@@ -658,7 +855,6 @@ def main():
         print("[Select] 선택 없음"); return
 
     holds = [holds[i] for i in idx]
-    # 자동 정렬 코드 삭제
     # holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
     for new_id, h in enumerate(holds):
         h["hold_index"] = new_id
@@ -697,7 +893,6 @@ def main():
 
     # (8) 모든 홀드 3D/각도 & 서보 타깃 생성(레이저 기준 적용)
     depth_m = cap.get_depth_meters()
-    depth_m = cv2.reszie(depth_m, (1280,720), interpolation=cv2.INTER_NEAREST)
     holds_3d = holds_to_3d(holds, depth_m, cap.deproject)
     matched_results = []
     for h in holds_3d:
