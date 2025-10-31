@@ -26,6 +26,9 @@ from realsense_adapter import RealSenseColorDepth
 # 머리랑 다음 홀드 위치 계산해서 가중치 준 이후 2차 이동하는 부분
 from head_view_bias import (HeadViewBias3DParams, compute_bias_angles_3d, head_center_from_coords, clamp)
 
+# hold_utils.py
+from hold_utils import assign_indices
+
 # ========= 사용자 환경 경로 =========
 MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\param\best_6.pt"
 
@@ -1029,7 +1032,7 @@ def main():
         print("[Select] 선택 없음"); return
 
     holds = [holds[i] for i in idx]
-    holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
+    holds = assign_indices(holds, row_tol=ROW_TOL_Y)
 
     for h in holds:
         if "mask" not in h:

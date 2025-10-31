@@ -26,13 +26,8 @@ from click_select import interactive_select_live_left_only
 # === RealSense 어댑터(컬러만 사용, depth는 무시) ===
 from realsense_adapter import RealSenseColorDepth
 
-# === 홀드 유틸 ===
-try:
-    from hold_utils import initial_5frames_all_classes, assign_indices
-    _HAS_ASSIGN = True
-except Exception:
-    from hold_utils import initial_5frames_all_classes
-    _HAS_ASSIGN = False
+# _HAS_ASSIGN 삭제
+from hold_utils import initial_5frames_all_classes, assign_indices
 
 # ========= 사용자 경로 =========
 MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\param\best_6.pt"
