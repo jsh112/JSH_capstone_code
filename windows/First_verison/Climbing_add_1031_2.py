@@ -445,28 +445,28 @@ def _event_loop(size):
     last_advanced_time = 0.0
     return pose, blocked_state, out, t_prev, last_advanced_time
 
-def assign_indices_row_major(holds, row_tol=30):
-    """
-    매칭 없이 '한쪽' 목록에만 번호 부여:
-    1) y기반 행 클러스터링(row_tol px)
-    2) 각 행 안에서 x 오름차순
-    3) 위 순서대로 hold_index = 0..N-1 부여
-    return: 새 순서대로 정렬된 holds 리스트
-    """
-    if not holds:
-        return []
-
-    rows = _cluster_rows_by_y(holds, row_tol=row_tol)  # 이미 코드에 있는 함수 사용
-    ordered = []
-    hid = 0
-    for row_y, idxs in rows:  # y 오름차순으로 정렬된 행
-        # 행 내부는 x 오름차순
-        idxs_sorted = sorted(idxs, key=lambda i: holds[i]["center"][0])
-        for i in idxs_sorted:
-            holds[i]["hold_index"] = hid
-            ordered.append(holds[i])
-            hid += 1
-    return ordered
+# def assign_indices_row_major(holds, row_tol=30):
+#     """
+#     매칭 없이 '한쪽' 목록에만 번호 부여:
+#     1) y기반 행 클러스터링(row_tol px)
+#     2) 각 행 안에서 x 오름차순
+#     3) 위 순서대로 hold_index = 0..N-1 부여
+#     return: 새 순서대로 정렬된 holds 리스트
+#     """
+#     if not holds:
+#         return []
+#
+#     rows = _cluster_rows_by_y(holds, row_tol=row_tol)  # 이미 코드에 있는 함수 사용
+#     ordered = []
+#     hid = 0
+#     for row_y, idxs in rows:  # y 오름차순으로 정렬된 행
+#         # 행 내부는 x 오름차순
+#         idxs_sorted = sorted(idxs, key=lambda i: holds[i]["center"][0])
+#         for i in idxs_sorted:
+#             holds[i]["hold_index"] = hid
+#             ordered.append(holds[i])
+#             hid += 1
+#     return ordered
 
 def build_servo_targets(by_id, yaw_laser0, pitch_laser0, X_laser, O):
     servo_targets = {}
