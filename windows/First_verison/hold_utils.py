@@ -285,3 +285,25 @@ def assign_ids_by_yx(holds):
     for i, h in enumerate(enriched):
         h["hold_index"] = i
     return enriched
+
+def assign_indices(holds, row_tol=30):
+    if not holds:
+        return []
+    enriched = [{"cx": h["center"][0], "cy": h["center"][1], **h} for h in holds]
+    # 1) y로 정렬 후 '행' 묶기
+    enriched.sort(key=lambda h: h["cy"])
+    rows, cur = [], [enriched[0]]
+    for h_ in enriched[1:]:
+        if abs(h_["cy"] - cur[0]["cy"]) < row_tol:
+            cur.append(h_)
+        else:
+            rows.append(cur); cur = [h_]
+    rows.append(cur)
+    # 2) 각 행을 x로 정렬 → 순서 부여
+    final_sorted = []
+    for row in rows:
+        row.sort(key=lambda h: h["cx"])
+        final_sorted.extend(row)
+    for i, h in enumerate(final_sorted):
+        h["hold_index"] = i
+    return final_sorted

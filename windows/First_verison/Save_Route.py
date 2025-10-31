@@ -8,11 +8,10 @@ from ultralytics import YOLO
 import csv
 import argparse
 
-# === MediaPipe 모듈 ===
+# === MediaPipe ===
 from Climb_Mediapipe import PoseTracker, draw_pose_points
-# (참고) 기존 TouchCounter는 사용하지 않고 프레임별 streak 직접 관리
 
-# === (NEW) 웹 모듈 - 색상 선택 ===
+# === 웹 색상 선택 (파일명 라벨만; 감지는 항상 전체) ===
 _USE_WEB = True
 try:
     from web import choose_color_via_web
@@ -21,36 +20,41 @@ except Exception:
     def choose_color_via_web(*a, **k):
         raise RuntimeError("A_web 모듈이 로드되지 않았습니다.")
 
-# ========= 사용자 환경 경로 =========
-MODEL_PATH     = r"C:\Users\PC\Desktop\Segmentation_Hold\best_5.pt"
+# === 클릭 선택(단일 화면) ===
+from click_select import interactive_select_live_left_only
 
-CAM1_INDEX     = 1   # 왼쪽 카메라
-CAM2_INDEX     = 2   # 오른쪽 카메라
+# === RealSense 어댑터(컬러만 사용, depth는 무시) ===
+from realsense_adapter import RealSenseColorDepth
 
-SWAP_INPUT     = False   # 입력 좌/우 스왑
-SWAP_DISPLAY   = False   # 창 표시 좌/우 스왑
+# === 홀드 유틸 ===
+try:
+    from hold_utils import initial_5frames_all_classes, assign_indices
+    _HAS_ASSIGN = True
+except Exception:
+    from hold_utils import initial_5frames_all_classes
+    _HAS_ASSIGN = False
 
-WINDOW_NAME    = "RAW L | R  (10f merged; MP Left; LIVE Fill)"
+# ========= 사용자 경로 =========
+MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\param\best_6.pt"
+
+# ========= 런타임 파라미터 =========
+WINDOW_NAME    = "SaveRoute (D455 color only)"
 THRESH_MASK    = 0.7
 ROW_TOL_Y      = 30
-SELECTED_COLOR = None    # 예: 'orange' (None=전체)
+SELECTED_COLOR = None    # 예) "orange" (None=전체). ← 파일명 라벨만!
 
-# 연속 프레임 터치 기준 (잡았다 판정)
-TOUCH_THRESHOLD = 10     # 연속 프레임 임계
+# 터치 판정(프레임 기반)
+TOUCH_THRESHOLD = 10
 
-CAP_SIZE = (1024, 576)   # (W,H)
-size = CAP_SIZE
-W, H = size
+# ==== 발 시각화/판정 옵션 ====
+SHOW_FEET      = True
+FOOT_ALPHA     = 0.35
+FOOT_OUTLINE   = 2
+FOOT_MIN_R_PX  = 12
+FOOT_R_SCALE   = 0.22
+FOOT_COLOR     = (0, 255, 255)
 
-ROTATE_MAP = {
-    1: cv2.ROTATE_90_COUNTERCLOCKWISE,  # LEFT
-    2: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
-}
-
-def rotate_image(img, rot_code):
-    return cv2.rotate(img, rot_code) if rot_code is not None else img
-
-# ==== 색상 맵 ====
+# ==== 색상 맵(시각화용) ====
 COLOR_MAP = {
     'Hold_Red':(0,0,255),'Hold_Orange':(0,165,255),'Hold_Yellow':(0,255,255),
     'Hold_Green':(0,255,0),'Hold_Blue':(255,0,0),'Hold_Purple':(204,50,153),
@@ -65,145 +69,89 @@ ALL_COLORS = {
 
 def ask_color_and_map_to_class(all_colors_dict):
     print("가능한 색상:", ", ".join(all_colors_dict.keys()))
-    s = input("필터할 색상 입력(엔터=전체): ").strip().lower()
+    s = input("CSV 파일명에 사용할 색상 라벨 입력(엔터=all): ").strip().lower()
     if not s:
-        print("→ 전체 표시 사용")
-        return None, "all"
-    mapped = all_colors_dict.get(s)
-    if mapped is None:
-        print(f"입력 '{s}' 은(는) 유효하지 않은 색입니다. 전체 표시 사용")
-        return None, "all"
-    print(f"선택된 클래스명: {mapped}")
-    return mapped, s  # (모델 클래스명, 사람 라벨)
+        print("→ 파일 라벨 'all' 사용")
+        return "all"
+    if s not in all_colors_dict:
+        print(f"입력 '{s}' 은(는) 유효하지 않은 색입니다. 'all' 사용")
+        return "all"
+    print(f"선택된 라벨: {s}")
+    return s
 
 def _sanitize_label(s: str) -> str:
     return "".join(ch for ch in s.lower() if ch.isalnum() or ch in ("_", "-"))
 
-def open_cams(idx1, idx2, size):
-    W_, H_ = size
-    # Windows면 CAP_DSHOW, Linux면 CAP_V4L2 권장
-    cap1 = cv2.VideoCapture(idx1, cv2.CAP_DSHOW)
-    cap2 = cv2.VideoCapture(idx2, cv2.CAP_DSHOW)
-    cap1.set(cv2.CAP_PROP_FRAME_WIDTH,  W_); cap1.set(cv2.CAP_PROP_FRAME_HEIGHT, H_)
-    cap2.set(cv2.CAP_PROP_FRAME_WIDTH,  W_); cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, H_)
-    if not cap1.isOpened() or not cap2.isOpened():
-        raise SystemExit("카메라 오픈 실패. 연결/권한 확인.")
-    return cap1, cap2
+# ========== 발(좌/우) 마스크 ==========
+def _draw_capsule(mask, p1, p2, r_px):
+    r = int(round(float(r_px)))
+    if r <= 0: return
+    p1 = tuple(map(int, map(round, p1)))
+    p2 = tuple(map(int, map(round, p2)))
+    cv2.line(mask, p1, p2, 255, thickness=2*r, lineType=cv2.LINE_AA)
+    cv2.circle(mask, p1, r, 255, -1, cv2.LINE_AA)
+    cv2.circle(mask, p2, r, 255, -1, cv2.LINE_AA)
 
-def extract_holds_with_indices(frame_bgr, model, selected_class_name=None,
-                               mask_thresh=0.7, row_tol=50):
-    h, w = frame_bgr.shape[:2]
-    res = model(frame_bgr)[0]
-    holds = []
-    if res.masks is None:
-        return []
-    masks = res.masks.data; boxes = res.boxes; names = model.names
-    for i in range(masks.shape[0]):
-        mask = masks[i].cpu().numpy()
-        mask_rs = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        binary = (mask_rs > mask_thresh).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        contour = max(contours, key=cv2.contourArea)
-        cls_id = int(boxes.cls[i].item()); conf = float(boxes.conf[i].item())
-        class_name = names[cls_id]
-        if (selected_class_name is not None) and (class_name != selected_class_name):
-            continue
-        M = cv2.moments(contour)
-        if M["m00"] == 0:
-            continue
-        cx = int(M["m10"]/M["m00"]); cy = int(M["m01"]/M["m00"])
-        holds.append({"class_name": class_name, "color": COLOR_MAP.get(class_name,(255,255,255)),
-                      "contour": contour, "center": (cx, cy), "conf": conf})
-    if not holds:
-        return []
-    # y-행, x-정렬 → hold_index 부여
-    enriched = [{"cx": h_["center"][0], "cy": h_["center"][1], **h_} for h_ in holds]
-    enriched.sort(key=lambda h: h["cy"])
-    rows, cur = [], [enriched[0]]
-    for h_ in enriched[1:]:
-        if abs(h_["cy"] - cur[0]["cy"]) < row_tol:
-            cur.append(h_)
-        else:
-            rows.append(cur); cur = [h_]
-    rows.append(cur)
-    final_sorted = []
+def build_foot_masks_sided(coords, shape_hw):
+    H, W = shape_hw
+    masks = {"left_foot": np.zeros((H,W), np.uint8),
+             "right_foot": np.zeros((H,W), np.uint8)}
+    # left
+    if "left_heel" in coords and "left_foot_index" in coords:
+        A = coords["left_heel"]; B = coords["left_foot_index"]
+        L = float(np.hypot(B[0]-A[0], B[1]-A[1]))
+        r = max(FOOT_MIN_R_PX, int(round(FOOT_R_SCALE * L)))
+        _draw_capsule(masks["left_foot"], A, B, r)
+    # right
+    if "right_heel" in coords and "right_foot_index" in coords:
+        A = coords["right_heel"]; B = coords["right_foot_index"]
+        L = float(np.hypot(B[0]-A[0], B[1]-A[1]))
+        r = max(FOOT_MIN_R_PX, int(round(FOOT_R_SCALE * L)))
+        _draw_capsule(masks["right_foot"], A, B, r)
+    return masks
+
+# ========== 로컬 폴백: 행(y)→열(x) 정렬로 ID 부여 ==========
+def _assign_indices_row_major_local(holds, row_tol=30):
+    if not holds: return []
+    # y기반 행 클러스터링
+    rows = []
+    for i, h in enumerate(holds):
+        cy = h["center"][1]
+        assigned = False
+        for row in rows:
+            if abs(cy - row["y"]) <= row_tol:
+                row["idxs"].append(i)
+                row["y"] = int(round(np.mean([holds[j]["center"][1] for j in row["idxs"]])))
+                assigned = True
+                break
+        if not assigned:
+            rows.append({"y": int(cy), "idxs": [i]})
+    rows.sort(key=lambda r: r["y"])
+    ordered = []
+    hid = 0
     for row in rows:
-        row.sort(key=lambda h: h["cx"])
-        final_sorted.extend(row)
-    for idx, h_ in enumerate(final_sorted):
-        h_["hold_index"] = idx
-    return final_sorted
+        idxs_sorted = sorted(row["idxs"], key=lambda i: holds[i]["center"][0])
+        for i in idxs_sorted:
+            holds[i]["hold_index"] = hid
+            ordered.append(holds[i])
+            hid += 1
+    return ordered
 
-def merge_holds_by_center(holds_lists, merge_dist_px=18):
-    merged = []
-    for holds in holds_lists:
-        for h in holds:
-            h = {k: v for k, v in h.items()}
-            h.pop("hold_index", None)
-            assigned = False
-            for m in merged:
-                dx = h["center"][0] - m["center"][0]
-                dy = h["center"][1] - m["center"][1]
-                if (dx*dx + dy*dy) ** 0.5 <= merge_dist_px:
-                    area_h = cv2.contourArea(h["contour"])
-                    area_m = cv2.contourArea(m["contour"])
-                    if (area_h > area_m) or (abs(area_h - area_m) < 1e-6 and h.get("conf",0) > m.get("conf",0)):
-                        m.update(h)
-                    assigned = True
-                    break
-            if not assigned:
-                merged.append(h)
-    return merged
-
-def assign_indices(holds, row_tol=50):
-    if not holds:
-        return []
-    enriched = [{"cx": h["center"][0], "cy": h["center"][1], **h} for h in holds]
-    enriched.sort(key=lambda h: h["cy"])
-    rows, cur = [], [enriched[0]]
-    for h_ in enriched[1:]:
-        if abs(h_["cy"] - cur[0]["cy"]) < row_tol:
-            cur.append(h_)
-        else:
-            rows.append(cur); cur = [h_]
-    rows.append(cur)
-    final_sorted = []
-    for row in rows:
-        row.sort(key=lambda h: h["cx"])
-        final_sorted.extend(row)
-    for idx, h_ in enumerate(final_sorted):
-        h_["hold_index"] = idx
-    return final_sorted
-
-def imshow_scaled(win, img, maxw=None):
-    if not maxw:
-        cv2.imshow(win, img); return
-    h_, w_ = img.shape[:2]
-    if w_ > maxw:
-        s = maxw / w_
-        img = cv2.resize(img, (int(w_*s), int(h_*s)))
-    cv2.imshow(win, img)
-
-def xoff_for(side, W_, swap):
-    return (W_ if swap else 0) if side=="L" else (0 if swap else W_)
-
-# ---------- 메인 ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no_web", action="store_true", help="웹 색상 선택 비활성화(콘솔 입력)")
+    ap.add_argument("--rotate90", action="store_true", help="컬러 프레임을 시계 90° 회전 (어댑터 내부 처리)")
+    ap.add_argument("--csv_prefix", default="grip_records", help="CSV 파일 접두사")
     args = ap.parse_args()
 
     # 경로 검증
     if not Path(MODEL_PATH).exists():
         raise FileNotFoundError(f"파일을 찾을 수 없습니다: {MODEL_PATH}")
 
-    # ================= 색상 필터 선택 =================
-    selected_class_name = None
-    selected_color_label = "all"   # 파일명용 사람 라벨
+    # ================= CSV 색상 라벨(파일명 용도만) =================
+    selected_color_label = "all"   # 파일명 라벨
 
-    # 1) 웹 선택
+    # 1) 웹 선택 (라벨만)
     if (not args.no_web) and _USE_WEB:
         try:
             chosen = choose_color_via_web(
@@ -211,194 +159,201 @@ def main():
                 defaults={}
             )  # ""이면 전체
             if chosen:
-                mapped = ALL_COLORS.get(chosen)
-                if mapped is None:
-                    print(f"[Filter] 웹 선택 '{chosen}' 무효 → 전체 표시")
-                else:
-                    print(f"[Filter] 웹 선택: {chosen} → {mapped}")
-                    selected_class_name  = mapped
+                if chosen.lower() in ALL_COLORS:
+                    print(f"[Label] 웹 선택: {chosen}")
                     selected_color_label = chosen.lower()
+                else:
+                    print(f"[Label] 웹 선택 '{chosen}' 무효 → 'all' 사용")
             else:
-                print("[Filter] 웹에서 전체 선택")
+                print("[Label] 웹에서 전체 선택 → 'all'")
         except Exception as e:
-            print(f"[Filter] 웹 선택 실패 → 콘솔 대체: {e}")
+            print(f"[Label] 웹 선택 실패 → 콘솔 대체: {e}")
 
-    # 2) 고정 설정
-    if (selected_class_name is None) and (SELECTED_COLOR is not None):
+    # 2) 고정 라벨
+    if selected_color_label == "all" and (SELECTED_COLOR is not None):
         sc = SELECTED_COLOR.strip().lower()
-        mapped = ALL_COLORS.get(sc)
-        if mapped is None:
-            print(f"[Filter] SELECTED_COLOR='{SELECTED_COLOR}' 무효 → 콘솔에서 선택")
-            selected_class_name, selected_color_label = ask_color_and_map_to_class(ALL_COLORS)
-        else:
-            print(f"[Filter] 고정 선택 클래스: {mapped}")
-            selected_class_name  = mapped
+        if sc in ALL_COLORS:
+            print(f"[Label] 고정 라벨 사용: {sc}")
             selected_color_label = sc
+        else:
+            print(f"[Label] SELECTED_COLOR='{SELECTED_COLOR}' 무효 → 콘솔에서 입력")
 
-    # 3) 콘솔 입력
-    if selected_class_name is None and (args.no_web or not _USE_WEB):
-        selected_class_name, selected_color_label = ask_color_and_map_to_class(ALL_COLORS)
+    # 3) 콘솔 입력(여전히 라벨만)
+    if selected_color_label == "all" and (args.no_web or not _USE_WEB):
+        selected_color_label = ask_color_and_map_to_class(ALL_COLORS)
 
-    # CSV 파일명(색상별 분리)
+    # CSV 파일명(색상별 분리; 감지는 전체)
     csv_label = _sanitize_label(selected_color_label) if selected_color_label else "all"
-    CSV_GRIPS_PATH = f"grip_records_{csv_label}.csv"
-    print(f"[Info] 그립 CSV 파일: {CSV_GRIPS_PATH}")
+    CSV_GRIPS_PATH = f"{args.csv_prefix}_{csv_label}.csv"
+    print(f"[Info] 그립 CSV 파일: {CSV_GRIPS_PATH}  (감지는 항상 전체 클래스)")
 
-    # 카메라 & 모델
-    capL_idx, capR_idx = CAM1_INDEX, CAM2_INDEX
-    if SWAP_INPUT:
-        capL_idx, capR_idx = capR_idx, capL_idx
-    cap1, cap2 = open_cams(capL_idx, capR_idx, size)
+    # === D455(컬러만 사용) & YOLO ===
+    # 회전은 어댑터 내부에서 처리 → 이후 프레임은 항상 같은 좌표계로 옴
+    cap = RealSenseColorDepth(color=(1280,720,30), depth=(848,480,30),
+                              align_to_color=True, rotate90=args.rotate90)
     model = YOLO(str(MODEL_PATH))
 
-    # ====== 초기 10프레임: YOLO seg & merge (※ RAW 프레임 그대로) ======
-    print(f"[Init] First 10 frames: YOLO seg & merge (RAW) ...")
-    L_sets, R_sets = [], []
-    for _ in range(2):
-        cap1.read(); cap2.read()  # 워밍업
+    # ====== 초기 N프레임: YOLO seg & merge (원본 좌표계 유지) ======
+    print(f"[Init] First 10 frames: YOLO seg & merge (detect=ALL, no-resize, no extra-rotate) ...")
+    holds = initial_5frames_all_classes(
+        cap, model, rotate_code=None,   # 어댑터가 이미 회전 적용함
+        n_frames=10,
+        mask_thresh=THRESH_MASK,
+        merge_dist_px=18
+    )
+    if not holds:
+        print("[Warn] 홀드가 검출되지 않았습니다."); return
 
-    for k in range(10):
-        ok1, f1 = cap1.read(); ok2, f2 = cap2.read()
-        if not (ok1 and ok2):
-            cap1.release(); cap2.release()
-            raise SystemExit("초기 프레임 캡쳐 실패")
-        # ✔ 렉티파이 없이 원본 사용
+    # ==== 선택: 단일 화면에서 클릭으로 골라서 후보 추출 ====
+    sel_indices = interactive_select_live_left_only(cap, holds, window=WINDOW_NAME)
+    if not sel_indices:
+        print("[Select] 선택 없음"); return
 
-        f1 = rotate_image(f1, ROTATE_MAP.get(capL_idx))  # 좌 카메라에 맞는 회전
-        f2 = rotate_image(f2, ROTATE_MAP.get(capR_idx))  # 우 카메라에 맞는 회전
+    selected_holds = [holds[i] for i in sel_indices]
 
-        Lr_k = cv2.resize(f1, (W, H)) if (f1.shape[1], f1.shape[0]) != (W, H) else f1
-        Rr_k = cv2.resize(f2, (W, H)) if (f2.shape[1], f2.shape[0]) != (W, H) else f2
+    # ==== 행(y)→열(x) 정렬로 hold_index 재부여 ====
+    holds = assign_indices(selected_holds, row_tol=ROW_TOL_Y)
 
-        holdsL_k = extract_holds_with_indices(Lr_k, model, selected_class_name, THRESH_MASK, ROW_TOL_Y)
-        holdsR_k = extract_holds_with_indices(Rr_k, model, selected_class_name, THRESH_MASK, ROW_TOL_Y)
-        L_sets.append(holdsL_k); R_sets.append(holdsR_k)
-        print(f"  - frame {k+1}/10: L={len(holdsL_k)}  R={len(holdsR_k)}")
-
-    holdsL = assign_indices(merge_holds_by_center(L_sets, 18), ROW_TOL_Y)
-    holdsR = assign_indices(merge_holds_by_center(R_sets, 18), ROW_TOL_Y)
-    if not holdsL or not holdsR:
-        cap1.release(); cap2.release()
-        print("[Warn] 왼/오 프레임에서 홀드가 검출되지 않았습니다.")
-        return
-
-    # 공통 ID
-    idxL = {h["hold_index"]: h for h in holdsL}
-    idxR = {h["hold_index"]: h for h in holdsR}
-    common_ids = sorted(set(idxL.keys()) & set(idxR.keys()))
-    if not common_ids:
-        print("[Warn] 좌/우 공통 hold_index가 없습니다.")
-        return
-    print(f"[Info] 공통 홀드 개수: {len(common_ids)}")
-
-    # ==== MediaPipe Pose ====
+    # ==== 상태 ====
     pose = PoseTracker(min_detection_confidence=0.5, model_complexity=1)
+    grip_records = []          # [(part, hold_id)]
+    logged = set()             # {(part, hold_id)}  중복 방지
+    streak = {}                # {(part, hold_id): frame_count}
 
-    # 기록 상태
-    grip_records = []
-    already_logged = set()  # ("part", hold_id) 임계 최초 도달만 기록
-    touch_streak = {}       # dict: (part_name, hold_id) -> int (연속 프레임 수)
-
-    # 화면
+    # (선택된 holds에 대해) 홀드 마스크 1회 생성 예약
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     t_prev = time.time()
+    masks_built = False
 
     try:
         while True:
-            ok1, f1 = cap1.read(); ok2, f2 = cap2.read()
-            if not (ok1 and ok2):
+            ok, frame = cap.read()
+            if not ok:
                 print("[Warn] 프레임 캡쳐 실패"); break
 
-            f1 = rotate_image(f1, ROTATE_MAP.get(capL_idx))  # LEFT
-            f2 = rotate_image(f2, ROTATE_MAP.get(capR_idx))  # RIGHT
+            vis = frame.copy()
+            H_cur, W_cur = vis.shape[:2]
 
-            # ✔ RAW 프레임 그대로 사용 (필요 시 리사이즈만)
-            Lr = cv2.resize(f1, (W, H)) if f1.shape[1] != W or f1.shape[0] != H else f1
-            Rr = cv2.resize(f2, (W, H)) if f2.shape[1] != W or f2.shape[0] != H else f2
-
-            vis = np.hstack([Rr, Lr]) if SWAP_DISPLAY else np.hstack([Lr, Rr])
-
-            # === 프레임 단위 라이브 채움 집합 ===
-            live_filled_ids = set()
-
-            # === MediaPipe 포즈 추정 & 표시 ===
-            coords = pose.process(Lr)  # 왼쪽 RAW에서 추정
-            left_xoff = xoff_for("L", W, SWAP_DISPLAY)
-            draw_pose_points(vis, coords, offset_x=left_xoff)
-
-            # === 라이브 터치 판정 ===
-            if coords:
-                current_touched = set()  # {(part_name, hold_id)}
-                for part_name, (px, py) in coords.items():
-                    for hid, hold in idxL.items():
-                        if cv2.pointPolygonTest(hold["contour"], (px, py), False) >= 0:
-                            current_touched.add((part_name, hid))
-
-                # streak 갱신 + 라이브 채움 + CSV 한 번 기록
-                for key in current_touched:
-                    touch_streak[key] = touch_streak.get(key, 0) + 1
-                    part_name, hid = key
-                    if touch_streak[key] >= TOUCH_THRESHOLD:
-                        live_filled_ids.add(hid)
-                        if key not in already_logged:
-                            cx, cy = idxL[hid]["center"]
-                            grip_records.append([part_name, hid, cx, cy])
-                            already_logged.add(key)
-
-                # 이번 프레임에 닿지 않은 키는 0으로 리셋 → 접촉 끊기면 즉시 해제
-                for key in list(touch_streak.keys()):
-                    if key not in current_touched:
-                        touch_streak[key] = 0
-            else:
-                # 포즈가 아예 안 잡히면 모두 해제
-                for key in list(touch_streak.keys()):
-                    touch_streak[key] = 0
-
-            # === 드로잉: 라이브 접촉 중인 홀드만 꽉 채움 ===
-            for side, holds in (("L", holdsL), ("R", holdsR)):
-                xoff = xoff_for(side, W, SWAP_DISPLAY)
+            # 선택된 홀드 마스크 1회 생성
+            if not masks_built:
                 for h in holds:
-                    cnt_shifted = h["contour"] + np.array([[[xoff, 0]]], dtype=h["contour"].dtype)
-                    cx, cy = h["center"]
+                    m = np.zeros((H_cur, W_cur), np.uint8)
+                    cv2.drawContours(m, [h["contour"]], -1, 255, -1)
+                    h["mask"] = m
+                masks_built = True
 
-                    if h["hold_index"] in live_filled_ids and side == "L":
-                        # 잡음 표시는 '왼쪽 보이는 프레임' 기준으로만 채움
-                        cv2.drawContours(vis, [cnt_shifted], -1, h["color"], thickness=cv2.FILLED)
+            # === 포즈 ===
+            coords = pose.process(frame)
+            draw_pose_points(vis, coords, offset_x=0)
 
-                    # 외곽선/라벨(항상)
-                    cv2.drawContours(vis, [cnt_shifted], -1, h["color"], 2)
-                    cv2.circle(vis, (cx+xoff, cy), 4, (255,255,255), -1)
-                    tag = f"ID:{h['hold_index']}"
-                    cv2.putText(vis, tag, (cx + xoff - 10, cy + 26),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 3, cv2.LINE_AA)
-                    cv2.putText(vis, tag, (cx + xoff - 10, cy + 26),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, h["color"], 2, cv2.LINE_AA)
+            # === 발 마스크(좌/우) 시각화 ===
+            foot_masks = None
+            if SHOW_FEET and coords:
+                foot_masks = build_foot_masks_sided(coords, (H_cur, W_cur))
+                overlay = vis.copy()
+                for m in foot_masks.values():
+                    if np.count_nonzero(m) > 0:
+                        overlay[m > 0] = FOOT_COLOR
+                cv2.addWeighted(overlay, FOOT_ALPHA, vis, 1.0 - FOOT_ALPHA, 0, vis)
+                # 외곽선
+                for m in foot_masks.values():
+                    if np.count_nonzero(m) > 0:
+                        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if cnts:
+                            cv2.drawContours(vis, cnts, -1, FOOT_COLOR, FOOT_OUTLINE, cv2.LINE_AA)
+
+            # === 그룹 단위(정확히: 대표 파트명) 터치 판단 ===
+            live_filled_ids = set()
+            touched_now = set()  # {('left_index', hid), ('right_index', hid), ('left_heel', hid), ('right_heel', hid)}
+
+            if coords:
+                left_hand_parts  = {"left_wrist","left_index","left_thumb","left_pinky"}
+                right_hand_parts = {"right_wrist","right_index","right_thumb","right_pinky"}
+                idx_map = {h["hold_index"]: h for h in holds}
+
+                for hid, hold in idx_map.items():
+                    # --- 손(좌): 네 파트 중 하나라도 in-polygon → 기록 키는 'left_index'
+                    for pname in [p for p in left_hand_parts if p in coords]:
+                        px, py = coords[pname]
+                        if cv2.pointPolygonTest(hold["contour"], (px, py), False) >= 0:
+                            touched_now.add(("left_index", hid))
+                            live_filled_ids.add(hid)
+                            break
+
+                    # --- 손(우): 기록 키는 'right_index'
+                    for pname in [p for p in right_hand_parts if p in coords]:
+                        px, py = coords[pname]
+                        if cv2.pointPolygonTest(hold["contour"], (px, py), False) >= 0:
+                            touched_now.add(("right_index", hid))
+                            live_filled_ids.add(hid)
+                            break
+
+                    # --- 발(좌/우): 마스크 겹침 → 기록 키는 'left_heel' / 'right_heel'
+                    if foot_masks is not None and "mask" in hold:
+                        hm = hold["mask"]
+                        if np.count_nonzero(cv2.bitwise_and(foot_masks["left_foot"], hm)) > 0:
+                            touched_now.add(("left_heel", hid))
+                            live_filled_ids.add(hid)
+                        if np.count_nonzero(cv2.bitwise_and(foot_masks["right_foot"], hm)) > 0:
+                            touched_now.add(("right_heel", hid))
+                            live_filled_ids.add(hid)
+
+                # === 프레임 누적 → 로깅(중복 금지) ===
+                for key in touched_now:
+                    streak[key] = streak.get(key, 0) + 1
+                    if streak[key] >= TOUCH_THRESHOLD and key not in logged:
+                        part, hid = key     # part 는 mediapipe 이름(예: 'left_index', 'right_heel')
+                        grip_records.append((part, hid))
+                        logged.add(key)
+
+                # 이번 프레임에서 터치 안 된 키는 0으로 리셋
+                for key in list(streak.keys()):
+                    if key not in touched_now:
+                        streak[key] = 0
+            else:
+                # 포즈 실종 시 카운트 리셋 (로그는 유지)
+                for key in list(streak.keys()):
+                    streak[key] = 0
+
+            # === 드로잉(컨투어/라벨/채움) ===
+            for h in holds:
+                cls_color = COLOR_MAP.get(h.get("class_name",""), (255,255,255))
+                cv2.drawContours(vis, [h["contour"]], -1, cls_color, 2)
+                cx, cy = h["center"]
+                if h["hold_index"] in live_filled_ids:
+                    cv2.drawContours(vis, [h["contour"]], -1, cls_color, thickness=cv2.FILLED)
+                tag = f"ID:{h['hold_index']}"
+                cv2.circle(vis, (cx, cy), 4, (255,255,255), -1)
+                cv2.putText(vis, tag, (cx - 10, cy + 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 3, cv2.LINE_AA)
+                cv2.putText(vis, tag, (cx - 10, cy + 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
 
             # FPS
             t_now = time.time()
             fps = 1.0 / max(t_now - (t_prev), 1e-6); t_prev = t_now
             cv2.putText(vis, f"FPS: {fps:.1f}",
-                        (10, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+                        (10, H_cur-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
             cv2.putText(vis, f"FPS: {fps:.1f}",
-                        (10, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 1, cv2.LINE_AA)
+                        (10, H_cur-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 1, cv2.LINE_AA)
 
-            imshow_scaled(WINDOW_NAME, vis, None)
-
-            k = cv2.waitKey(1) & 0xFF
-            if k == ord('q'):
+            cv2.imshow(WINDOW_NAME, vis)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
 
     finally:
-        cap1.release(); cap2.release()
+        try: cap.release()
+        except: pass
         cv2.destroyAllWindows()
         try: pose.close()
         except: pass
 
-    # 그립 기록 CSV 저장 (색상별 파일명)
+    # === CSV 저장 (part, hold_id) ===
     with open(CSV_GRIPS_PATH, "w", newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["part", "hold_id", "cx", "cy"])
-        writer.writerows(grip_records)
+        writer.writerow(["part", "hold_id"])               # ← 헤더는 러너와 동일
+        writer.writerows(grip_records)                      # 예: ('left_index', 7), ('right_heel', 11) ...
+
     print(f"[Info] 그립 CSV 저장 완료: {CSV_GRIPS_PATH} (총 {len(grip_records)}개)")
 
 if __name__ == "__main__":
