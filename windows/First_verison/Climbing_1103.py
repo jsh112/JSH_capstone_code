@@ -12,7 +12,7 @@ from Climb_Mediapipe import PoseTracker, draw_pose_points, classify_occluder
 from find_laser import capture_once_and_return
 
 # hold 관련 코드
-from hold_utils import initial_5frames_all_classes
+from hold_utils import initial_5frames_all_classes, assign_indices
 
 # servo 관련 코드
 from servo_utils import send_servo_angles, yaw_pitch_from_X
@@ -23,6 +23,10 @@ from web import choose_color_via_web
 
 from realsense_adapter import RealSenseColorDepth
 
+# 머리랑 다음 홀드 위치 계산해서 가중A치 준 이후 2차 이동하는 부분
+# from head_view_bias import (HeadViewBias3DParams, compute_bias_angles_3d, head_center_from_coords, clamp)
+# from edge_bias import (HeadViewBias3DParams, head_center_from_coords, clamp, compute_edge_bias_from_pixels)
+
 # ========= 사용자 환경 경로 =========
 MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\param\best_6.pt"
 
@@ -30,14 +34,11 @@ SWAP_DISPLAY   = False   # 화면 표시 좌/우 스와프
 
 WINDOW_NAME    = "Rectified L | R"
 THRESH_MASK    = 0.7
-ROW_TOL_Y      = 10
+ROW_TOL_Y      = 1
 
 # 자동 진행(터치→다음 홀드) 관련
-TOUCH_THRESHOLD = 1     # in-polygon 연속 프레임 임계(기본 10)
+TOUCH_THRESHOLD = 5    # in-polygon 연속 프레임 임계(기본 10)
 ADV_COOLDOWN    = 0.5    # 연속 넘김 방지 쿨다운(sec)
-
-# ✅ 시간 기반 디버그 임계(초)
-TOUCH_TIME_S    = 0.150 
 
 # 저장 옵션
 SAVE_VIDEO     = False
@@ -50,9 +51,9 @@ CAL_YAW_OFFSET   = 0.0
 CAL_PITCH_OFFSET = 0.0
 
 # ---- 레이저 원점(LEFT 기준) 오프셋 (cm) ----
-LASER_OFFSET_CM_LEFT = 2.5
-LASER_OFFSET_CM_UP   = 7.3
-LASER_OFFSET_CM_FWD  = -8.0
+LASER_OFFSET_CM_LEFT = -1.2
+LASER_OFFSET_CM_UP   = 10.2
+LASER_OFFSET_CM_FWD  = -7.0
 Y_UP_IS_NEGATIVE     = True  # 위 방향이 -y인 좌표계면 True
 
 # === 서보 기준(중립 90/90) & 부호/스케일 ===
@@ -62,6 +63,8 @@ YAW_SIGN       = -1.0   # 반대로 가면 -1.0
 PITCH_SIGN     = +1.0   # 반대로 가면 -1.0
 YAW_SCALE      = 1.0    # 필요시 감도 미세조정
 PITCH_SCALE    = 1.0
+K_2ND_YAW_GAIN   = 1.2   # 1.2~2.0에서 튜닝
+K_2ND_PITCH_GAIN = 1.2
 
 # === 전역 기준(초기 레이저 기준 각) ===
 YAW_LASER0 = None
@@ -94,13 +97,16 @@ FRAC_HARD_MIN  = 0.30      # 강한 차분 픽셀 비율 최소(30% 이상이면
 FRAC_DYN_MIN   = 0.55      # 동적 임계(노이즈 적응) 기준 비율
 ERODE_ITERS    = 1         # 마스크 코어만 사용(경계 흔들림 억제). 0~1 권장
 
+# === 차폐(가림) 판정 시작 인덱스 ===
+START_OCCLUSION_AT = 4   # 0-based. 4 → '다섯번째'부터
+
 ROTATE_MAP = {
     1: cv2.ROTATE_90_COUNTERCLOCKWISE,  # LEFT
     2: cv2.ROTATE_90_CLOCKWISE,         # RIGHT
 }
 
 CAP_SIZE = (1280, 720)
-size = CAP_SIZE 
+size = CAP_SIZE
 # ======== Servo controller import (stub fallback) ========
 try:
     from servo_control import DualServoController
@@ -116,13 +122,12 @@ except Exception:
         def laser_off(self): print("[Servo] (stub) laser_off")
         def close(self): pass
 # ======================
-
 def rotate_image(img, rot_code):
     return cv2.rotate(img, rot_code) if rot_code is not None else img
 
 def rotate_point(pt, shape_hw, rot_code):
     """(x,y) 픽셀을 주어진 회전 코드로 변환. shape_hw는 '회전 전'의 (H,W)."""
-    if pt is None or rot_code is None: 
+    if pt is None or rot_code is None:
         return pt
     h, w = shape_hw
     x, y = int(pt[0]), int(pt[1])
@@ -141,7 +146,7 @@ def _open_camera_and_model():
 
 def _parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="COM5")
+    ap.add_argument("--port", default="COM4")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--no_auto_advance", action="store_true")
     ap.add_argument("--no_web", action="store_true")
@@ -218,8 +223,6 @@ def extra_yaw_deg(X, O, X_laser, y_up_is_negative=True):
 
     # 최종 가산(deg). K_EXTRA_YAW_DEG 부호/크기는 현장에서 튜닝
     return sgn * K_EXTRA_YAW_DEG * lateral_term * depth_term
-
-
 
 def depth_median_in_mask(depth_m, mask):
     ys, xs = np.where(mask > 0)
@@ -313,15 +316,12 @@ def _mask_from_contour(shape_hw, contour, dilate_k=DILATE_KERNEL_SZ):
         m = cv2.dilate(m, ker, iterations=1)
     return m
 
-'''
-mediapipe 발 버퍼 추가
-'''
-
 def _foot_mask_from_coords(coords, shape_hw):
     H, W = shape_hw
-    m = np.zeros((H, W), np.uint8)
+    masks = {"left_foot": np.zeros((H,W), np.uint8),
+             "right_foot": np.zeros((H,W), np.uint8)}
 
-    def _draw_capsule_local(mask, p1, p2, radius_px):
+    def _draw_capsule(mask, p1, p2, radius_px):
         p1 = tuple(map(int, map(round, p1)))
         p2 = tuple(map(int, map(round, p2)))
         r  = int(round(float(radius_px)))
@@ -330,17 +330,17 @@ def _foot_mask_from_coords(coords, shape_hw):
         cv2.circle(mask, p1, r, 255, -1, cv2.LINE_AA)
         cv2.circle(mask, p2, r, 255, -1, cv2.LINE_AA)
 
-    def _draw_foot(heel_name, index_name):
+    def _draw_foot(dst, heel_name, index_name):
         if heel_name in coords and index_name in coords:
             A = np.array(coords[heel_name], dtype=float)
             B = np.array(coords[index_name], dtype=float)
             L = np.linalg.norm(B - A)
-            r = max(12.0, 0.22 * L)   # 필요시 튜닝: 0.18~0.28
-            _draw_capsule_local(m, A, B, r)
+            r = max(12.0, 0.22 * L)
+            _draw_capsule(dst, A, B, r)
 
-    _draw_foot("left_heel",  "left_foot_index")
-    _draw_foot("right_heel", "right_foot_index")
-    return m
+    _draw_foot(masks["left_foot"],  "left_heel",  "left_foot_index")
+    _draw_foot(masks["right_foot"], "right_heel", "right_foot_index")
+    return masks
 
 def _build_hold_db_with_baseline(cap, size, holds, n_frames=10, diff_gate=12.0):
     W, H = size
@@ -392,7 +392,7 @@ def depth_median_at(depth_m, x, y, r=3):
     y0, y1 = max(0, y-r), min(h-1, y+r)
     patch = depth_m[y0:y1+1, x0:x1+1]
     vals = patch[(patch > 0) & np.isfinite(patch)]
-    if vals.size == 0: 
+    if vals.size == 0:
         return None
     return float(np.median(vals))
 
@@ -409,29 +409,6 @@ def _event_loop(size):
     t_prev = time.time()
     last_advanced_time = 0.0
     return pose, blocked_state, out, t_prev, last_advanced_time
-
-def assign_indices_row_major(holds, row_tol=30):
-    """
-    매칭 없이 '한쪽' 목록에만 번호 부여:
-    1) y기반 행 클러스터링(row_tol px)
-    2) 각 행 안에서 x 오름차순
-    3) 위 순서대로 hold_index = 0..N-1 부여
-    return: 새 순서대로 정렬된 holds 리스트
-    """
-    if not holds:
-        return []
-
-    rows = _cluster_rows_by_y(holds, row_tol=row_tol)  # 이미 코드에 있는 함수 사용
-    ordered = []
-    hid = 0
-    for row_y, idxs in rows:  # y 오름차순으로 정렬된 행
-        # 행 내부는 x 오름차순
-        idxs_sorted = sorted(idxs, key=lambda i: holds[i]["center"][0])
-        for i in idxs_sorted:
-            holds[i]["hold_index"] = hid
-            ordered.append(holds[i])
-            hid += 1
-    return ordered
 
 def build_servo_targets(by_id, yaw_laser0, pitch_laser0, X_laser, O):
     servo_targets = {}
@@ -502,7 +479,7 @@ def _resolve_part_name(tpart: str, coords: dict, grip_names: set):
     return None
 
 def _run_frame_loop(cap, size, holds, matched_results,
-                    servo_targets,auto_advance_enabled, pose, blocked_state,
+                    servo_targets,auto_advance_enabled, pose, blocked_staqte,
                     out, t_prev, last_advanced_time, current_target_id, cur_yaw, cur_pitch, ctl,
                     route_pairs, route_pos, current_target_part,
                     hold_db, laser_px=None, yaw_laser0=0.0, pitch_laser0=0.0):
@@ -510,22 +487,29 @@ def _run_frame_loop(cap, size, holds, matched_results,
     touch_streak = {}
     frame_id = 0
 
-    holds_by_id = {h["hold_index"]: h for h in holds}
+    # ARROW_STICKY_SEC = 3.0   # 화살표 유지 시간(초)
+    # arrow_expire_ts = 0.0
+    # arrow_src_px, arrow_dst_px = None, None
 
-    # ===== 시간 기반 터치 트래킹/로깅 상태 =====
-    TOUCH_TIME_S_LOCAL = globals().get("TOUCH_TIME_S", 0.350)  # 상단에 TOUCH_TIME_S 없으면 350ms 기본
-    contact_start_ts = {}   # {(part, hold_id): 시작 시각}
-    reported_350ms   = set()# 350ms 통과 후 이미 로그 출력한 키
-    last_prog_print  = {}   # 진행 로그(스팸 방지용) 최근 출력 시각
+    # ===== 차폐 판정 on/off 게이트 =====
+    total_routes = len(route_pairs)
+    occlusion_active = (route_pos >= START_OCCLUSION_AT)
+
+    terminal_finished = False
+
+    holds_by_id = {h["hold_index"]: h for h in holds}
+    mr_by_id = {mr["hid"]: mr for mr in matched_results}  # ★ 추가: hid→matched_result
 
     try:
         # 통계로 쓸 리스트 추가
-        occlusion_logs = []
+        # occlusion_logs = []
         while True:
             ok, Limg = cap.read()
             if not ok:
                 print("[Warn] 프레임 캡쳐 실패"); break
             vis = Limg.copy()
+            if terminal_finished:
+                occlusion_active = False  # 종료 상태에서는 항상 가림 OFF
 
             # === (NEW) 최초 레이저 위치 오버레이 (맨 마지막에 그려 가려지지 않게) ===
             if laser_px is not None:
@@ -543,9 +527,55 @@ def _run_frame_loop(cap, size, holds, matched_results,
 
             # (선택) 홀드/라벨 표시
             for h in holds:
-                cv2.drawContours(vis, [h["contour"]], -1, h["color"], 2)
+                cv2.drawContours(vis, [h["contour"]], -1, h["color"], 1)  # 얇게
+
+                # [ADD] 홀드 바운딩박스(노란색 / 타깃은 주황색). 25.10.31 - 1
+                bx, by, bw, bh = cv2.boundingRect(np.asarray(h["contour"], dtype=np.int32))
+                color = (0, 255, 255) if h["hold_index"] != current_target_id else (0, 165, 255)
+                thick = 2 if h["hold_index"] != current_target_id else 3
+
+                # [ADD] 홀드 중심점에서 바운딩 박스의 상하좌우, 각 꼭짓점으로 뻗어나가는 선 그리기
+                # [ADD] 타깃 홀드의 중심에서 바운딩박스 8방향(상/하/좌/우 + 모서리)으로 선 그리기
+                if h["hold_index"] == current_target_id:
+                    cx, cy = int(h["center"][0]), int(h["center"][1])
+
+                    # 바운딩박스 코너/중점 계산 (픽셀 경계 포함하려고 -1 처리)
+                    xL, yT = bx, by
+                    xR, yB = bx + bw - 1, by + bh - 1
+                    xM = (xL + xR) // 2
+                    yM = (yT + yB) // 2
+
+                    # 8개 방향 포인트
+                    pts = {
+                        "N":  (xM, yT),
+                        "S":  (xM, yB),
+                        "W":  (xL, yM),
+                        "E":  (xR, yM),
+                        "NW": (xL, yT),
+                        "NE": (xR, yT),
+                        "SW": (xL, yB),
+                        "SE": (xR, yB),
+                    }
+
+                    for dir_key, (tx, ty) in pts.items():
+                        is_corner = dir_key in ("NW", "NE", "SW", "SE")
+                        color = (255, 0, 255) if is_corner else (0, 255, 255)
+                        cv2.arrowedLine(
+                            vis, (cx, cy), (int(tx), int(ty)),
+                            color,
+                            1,                  # ← 선 두께 1px
+                            cv2.LINE_AA,
+                            tipLength=0.10      # ← 화살촉도 아주 작게
+                        )
+                        cv2.circle(vis, (int(tx), int(ty)), 2, color, -1)  # 엔드포인트 점도 작게
+                        # cv2.putText(...) 라벨 두께도 1로 유지
+                # ---------------------------------------------------------------------------------- #
+
+                # Drawing Bounding box on hold that detected by YOLO
+                # Modify in 11/13 - JSH
+                # cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), color, thick)
                 cx, cy = h["center"]
-                cv2.circle(vis, (cx, cy), 4, (255,255,255), -1)
+                cv2.circle(vis, (cx, cy), 1, (255,255,255), -1)  # 반지름 1px (조금만 크게 보이고 싶으면 2로)
                 tag = f"ID:{h['hold_index']}"
                 if h["hold_index"] == current_target_id:
                     tag = "[TARGET] " + tag
@@ -571,36 +601,42 @@ def _run_frame_loop(cap, size, holds, matched_results,
 
             if coords:
                 H_, W_ = vis.shape[:2]
-                foot_mask = np.zeros((H_, W_), np.uint8)
 
+                # 좌/우 개별 발 마스크 생성
                 def _draw_capsule(mask, p1, p2, r):
-                    # 선 두께를 2r로 그리면 내부가 채워진 캡슐이 됨
                     cv2.line(mask, p1, p2, 255, thickness=2*r, lineType=cv2.LINE_AA)
                     cv2.circle(mask, p1, r, 255, -1, cv2.LINE_AA)
                     cv2.circle(mask, p2, r, 255, -1, cv2.LINE_AA)
 
-                for heel_name, index_name in [("left_heel","left_foot_index"),
-                                            ("right_heel","right_foot_index")]:
+                foot_masks = {
+                    "left_foot":  np.zeros((H_, W_), np.uint8),
+                    "right_foot": np.zeros((H_, W_), np.uint8),
+                }
+
+                for heel_name, index_name, key in [
+                    ("left_heel",  "left_foot_index",  "left_foot"),
+                    ("right_heel", "right_foot_index", "right_foot"),
+                ]:
                     if heel_name in coords and index_name in coords:
                         Ax, Ay = map(lambda v: int(round(v)), coords[heel_name])
                         Bx, By = map(lambda v: int(round(v)), coords[index_name])
                         L = float(np.hypot(Bx - Ax, By - Ay))
                         r = max(12, int(round(0.22 * L)))
-                        _draw_capsule(foot_mask, (Ax, Ay), (Bx, By), r)
+                        _draw_capsule(foot_masks[key], (Ax, Ay), (Bx, By), r)
 
-                if np.count_nonzero(foot_mask) > 0:
-                    # 반투명 채움
+                # 시각화(선택): 좌/우 발 마스크 오버레이 + 외곽선
+                for name, m in foot_masks.items():
+                    if np.count_nonzero(m) == 0:
+                        continue
                     overlay = vis.copy()
-                    overlay[foot_mask > 0] = (0, 255, 255)  # 노란색
+                    overlay[m > 0] = (0, 255, 255)  # 노란색
                     cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
-
-                    # 외곽선
-                    cnts, _ = cv2.findContours(foot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if cnts:
                         cv2.drawContours(vis, cnts, -1, (0, 255, 255), 2, cv2.LINE_AA)
 
             # 타깃 홀드 이미지 차분
-            if frame_id % DIFF_EVERY_N == 0 and current_target_id in hold_db:
+            if occlusion_active and (frame_id % DIFF_EVERY_N == 0) and (current_target_id in hold_db):
                 info = hold_db[current_target_id]
                 x,y,w,hh = info["bbox"]
                 grayL = cv2.cvtColor(Limg, cv2.COLOR_BGR2GRAY)
@@ -647,24 +683,17 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     if part_to_report != getattr(_run_frame_loop, "_prev_block_part", None):
                         print(f"[BLOCKED] 홀드 ID {current_target_id} — {part_to_report} 부위가 가림")
                         _run_frame_loop._prev_block_part = part_to_report
-                        # === [지표2 로깅 추가] ===
-                        occlusion_logs.append({
-                            "frame_id": frame_id,
-                            "timestamp": time.time(),
-                            "hold_id": current_target_id,
-                            "blocked_part": part_to_report,
-                            "label": label,  # 'grip' or 'blocked'
-                        })
                 else:
                     # [NEW] grip 상태도 일정 간격으로 기록 (데이터 폭 방지용)
-                    if frame_id % 5 == 0:  # 20FPS 기준 약 4Hz 샘플링
-                        occlusion_logs.append({
-                            "frame_id": frame_id,
-                            "timestamp": time.time(),
-                            "hold_id": current_target_id,
-                            "blocked_part": "none",
-                            "label": "grip",
-                        })
+                    # if frame_id % 5 == 0:  # 20FPS 기준 약 4Hz 샘플링
+                    #     occlusion_logs.append({
+                    #         "frame_id": frame_id,
+                    #         "timestamp": time.time(),
+                    #         "hold_id": current_target_id,
+                    #         "blocked_part": "none",
+                    #         "label": "grip",
+                    #     })
+                    continue
                     _run_frame_loop._prev_block_part = None
 
             # 목표 (part, hold_id) 판정
@@ -681,41 +710,57 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     cv2.putText(vis, f"[WARN] hold_id {tid} not present", (20, 46),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
                 else:
-                    '''
-                    10/29일 추가
-                    '''
                     # === (NEW) 손/발 그룹 후보 구성 ===
                     hand_set = getattr(pose, "hand_parts", set())
-                    foot_set = getattr(pose, "foot_grip_parts", set())
 
                     csv_wants_hand = (tpart_csv in {"hand", "any_hand"})
-                    csv_wants_foot = (tpart_csv in {"foot", "any_foot"})
 
                     is_hand_part = (tpart in hand_set)
-                    is_foot_part = (tpart in foot_set)
 
-                    if csv_wants_foot or is_foot_part:
-                        group_label = "foot"
-                        touched_any = False
-
-                        # ★ 발은 마스크↔마스크 겹침으로 판정
-                        foot_m = _foot_mask_from_coords(coords, (H, W))
+                    # tpart_csv 는 CSV에서 읽은 문자열 (left_heel / right_heel)
+                    if tpart_csv in {"left_heel", "right_heel"}:
+                        foot_masks = _foot_mask_from_coords(coords, (H, W))
                         info = hold_db.get(tid)
-                        if info is not None:
-                            hold_m = info.get("mask")
-                            if hold_m is not None:
-                                overlap = cv2.bitwise_and(foot_m, hold_m)
-                                if np.count_nonzero(overlap) > 0:
-                                    touched_any = True
+                        hold_m = info.get("mask") if info is not None else None
 
+                        touched_any = False
+                        if hold_m is not None and foot_masks:
+                            if tpart_csv == "left_heel":
+                                ov = cv2.bitwise_and(foot_masks["left_foot"], hold_m)
+                                touched_any = (np.count_nonzero(ov) > 0)
+                            else:  # "right_heel"
+                                ov = cv2.bitwise_and(foot_masks["right_foot"], hold_m)
+                                touched_any = (np.count_nonzero(ov) > 0)
+
+                        group_label = tpart_csv              # ← 화면 표시는 항상 left_heel / right_heel
                         display_key = (group_label, tid)
+
+                        current_touched = set()
+                        if touched_any:
+                            current_touched.add(display_key)
 
                     else:
                         # hand 또는 특정 파트는 기존처럼 포인트 in-polygon
-                        if csv_wants_hand or is_hand_part:
+                        # --- Hand logic with side-awareness ---
+                        if csv_wants_hand:
+                            # CSV가 'hand'/'any_hand'면 양손 허용(기존 동작)
                             candidate_parts = [n for n in hand_set if n in coords]
                             group_label = "hand"
+
+                        elif is_hand_part:
+                            # CSV가 'left_index' 같은 '특정 손 관절' 지시 시 → 같은 '측'만 허용
+                            if tpart.startswith("left_"):
+                                candidate_parts = [n for n in hand_set if n.startswith("left_") and n in coords]
+                                group_label = "left_hand"
+                            elif tpart.startswith("right_"):
+                                candidate_parts = [n for n in hand_set if n.startswith("right_") and n in coords]
+                                group_label = "right_hand"
+                            else:
+                                # 접두사 불명일 땐 해당 관절만 엄격히
+                                candidate_parts = [tpart] if (tpart in coords) else []
+                                group_label = tpart
                         else:
+                            # 손이 아닌 정확 지정 파트(예: 'left_heel')면 기존처럼 그 파트만
                             candidate_parts = [tpart] if (tpart in coords) else []
                             group_label = (tpart or tpart_csv)
 
@@ -732,26 +777,6 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     if touched_any:
                         current_touched.add(display_key)
 
-                    # ===== 시간 기반 카운트/로그 갱신 (display_key 사용) =====
-                    key_ts = display_key  # 시간 누적도 그룹 단위로
-                    now_t  = time.time()
-                    if touched_any:
-                        if key_ts not in contact_start_ts:
-                            contact_start_ts[key_ts] = now_t
-                        dur = now_t - contact_start_ts[key_ts]
-
-                        if dur < TOUCH_TIME_S_LOCAL and (now_t - last_prog_print.get(key_ts, 0)) > 0.10:
-                            print(f"[DBG] touching {key_ts[0]}@{key_ts[1]}  {dur*1000:.0f}ms / {TOUCH_TIME_S_LOCAL*1000:.0f}ms")
-                            last_prog_print[key_ts] = now_t
-
-                        if dur >= TOUCH_TIME_S_LOCAL and key_ts not in reported_350ms:
-                            print(f"[GRIP-350ms] confirmed: {key_ts[0]}@{key_ts[1]}  ({dur*1000:.0f} ms)")
-                            reported_350ms.add(key_ts)
-                    else:
-                        contact_start_ts.pop(key_ts, None)
-                        last_prog_print.pop(key_ts, None)
-                        reported_350ms.discard(key_ts)
-
                     # HUD도 그룹 라벨로
                     cnt = touch_streak.get(display_key, 0)
                     cv2.putText(vis, f"[GRIP] {group_label}@{tid} {cnt}/{TOUCH_THRESHOLD}",
@@ -763,6 +788,13 @@ def _run_frame_loop(cap, size, holds, matched_results,
                     for key in current_touched:
                         touch_streak[key] = touch_streak.get(key, 0) + 1
                         if touch_streak[key] >= TOUCH_THRESHOLD:
+                            if route_pos == (total_routes - 1):
+                                occlusion_active = False
+                                terminal_finished = True
+                                current_target_id = None          # ★ 타겟 제거
+                                current_target_part = None        # ★ 파트 안내 제거
+                                touch_streak.clear()              # ★ 카운터 초기화
+                                continue
                             now_t = time.time()
                             if (auto_advance_enabled
                                 and (route_pos < len(route_pairs) - 1)
@@ -774,6 +806,171 @@ def _run_frame_loop(cap, size, holds, matched_results,
                                     target_yaw, target_pitch = ty_tp
                                     send_servo_angles(ctl, target_yaw, target_pitch)
                                     cur_yaw, cur_pitch = target_yaw, target_pitch
+
+                                    # # ===== 2차(3D) 보정: 머리-다음홀드 =====
+                                    # 1) 머리 픽셀 좌표
+                                    # head_xy_px = head_center_from_coords(coords)  # (u,v)
+
+                                    # # 2) 다음 홀드 2D/3D/마스크
+                                    # hold_xy_px = holds_by_id[next_tid]["center"]
+                                    # mr = mr_by_id.get(next_tid)
+                                    # hold_xyz_m = None
+                                    # if mr is not None and ("X" in mr):
+                                    #     X_mm = np.array(mr["X"], dtype=np.float64)
+                                    #     hold_xyz_m = (X_mm / 1000.0).astype(np.float64)  # (m)
+
+                                    # hold_mask = None
+                                    # info_db = hold_db.get(next_tid)
+                                    # if info_db is not None:
+                                    #     hold_mask = info_db.get("mask")
+
+                                    # # 3) edge 기반 보정각 계산 (edge 실패 시 내부적으로 기존 방식으로 폴백)
+                                    # if (head_xy_px is not None) and (hold_xy_px is not None) and (hold_xyz_m is not None) and (hold_mask is not None):
+                                    #     p3 = HeadViewBias3DParams()
+                                    #     dyaw_w, dpitch_w, info = compute_edge_bias_from_pixels(
+                                    #         cap,
+                                    #         head_xy_px=head_xy_px,
+                                    #         hold_xy_px=hold_xy_px,
+                                    #         hold_xyz_m=hold_xyz_m,
+                                    #         hold_mask=hold_mask,
+                                    #         params=p3,
+                                    #         hold_range_m=float(np.linalg.norm(hold_xyz_m))  # R
+                                    #     )
+                                    # else:
+                                    #     # 좌표 부족시 0 보정
+                                    #     dyaw_w, dpitch_w = 0.0, 0.0
+                                    #     info = {"method": "none", "edge_px": None, "sector": None, "R_m": None, "theta_max_deg": 0.0, "dist_m": None}
+
+                                    # # 4) (그대로 유지) 화살표 3초 유지용 캐시 갱신
+                                    # if head_xy_px is not None and hold_xy_px is not None:
+                                    #     arrow_src_px = head_xy_px      # 사람(머리) → 홀드
+                                    #     arrow_dst_px = hold_xy_px
+                                    #     arrow_expire_ts = time.time() + ARROW_STICKY_SEC
+
+                                    # # 5) (선택) 디버그: 센터→edge 시각화
+                                    # edge_px = info.get("edge_px")
+                                    # if edge_px is not None:
+                                    #     cv2.arrowedLine(vis, (int(hold_xy_px[0]), int(hold_xy_px[1])),
+                                    #                         (int(edge_px[0]),     int(edge_px[1])),
+                                    #                         (0, 200, 0), 2, cv2.LINE_AA, tipLength=0.18)
+                                    #     cv2.circle(vis, (int(edge_px[0]), int(edge_px[1])), 2, (0,200,0), -1)
+
+                                    # # 6) world→servo 변환 및 전송(기존 경로와 동일)
+                                    # dyaw_w   *= K_2ND_YAW_GAIN
+                                    # dpitch_w *= K_2ND_PITCH_GAIN
+
+                                    # yaw_hold   = mr["yaw_deg"]     # 1차(월드) 기준
+                                    # pitch_hold = mr["pitch_deg"]
+
+                                    # yaw_hold2   = yaw_hold   + dyaw_w
+                                    # pitch_hold2 = pitch_hold + dpitch_w
+
+                                    # ty2, tp2 = servo_cmd_from_laser_ref(yaw_hold2, pitch_hold2, yaw_laser0, pitch_laser0)
+
+                                    # def _quantize(x, step): return round(x/step)*step
+                                    # SERVO_QUANT_STEP_DEG = globals().get("SERVO_QUANT_STEP_DEG", 0.1)
+                                    # SERVO_MIN_DELTA_DEG  = globals().get("SERVO_MIN_DELTA_DEG", 0.2)
+
+                                    # ty2_q   = _quantize(ty2, SERVO_QUANT_STEP_DEG)
+                                    # tp2_q   = _quantize(tp2, SERVO_QUANT_STEP_DEG)
+
+                                    # time.sleep(1.0)  # 1차 이동 안정화 대기(필요 시 조정)
+
+                                    # if (abs(ty2_q - target_yaw)   >= SERVO_MIN_DELTA_DEG) or \
+                                    # (abs(tp2_q - target_pitch) >= SERVO_MIN_DELTA_DEG):
+                                    #     send_servo_angles(ctl, ty2_q, tp2_q)
+                                    #     print(f"[EdgeBias] method={info.get('method')} sector={info.get('sector')} "
+                                    #         f"R={info.get('R_m',0):.2f}m θmax={info.get('theta_max_deg',0):.2f}° "
+                                    #         f"Δyaw={dyaw_w:+.3f}° Δpitch={dpitch_w:+.3f}°  "
+                                    #         f"servo:{target_yaw:.2f},{target_pitch:.2f} → {ty2_q:.2f},{tp2_q:.2f}")
+                                    # # ===== 보정 끝 =====
+
+                                    '''
+                                    # ===== 2차(3D) 보정: 머리-다음홀드 =====
+                                    # 1) 머리 픽셀 좌표 추출
+                                    head_xy_px = head_center_from_coords(coords)  # (u,v) or None
+
+                                    # 2) 다음 홀드 2D/3D 준비
+                                    hold_xy_px = holds_by_id[next_tid]["center"]  # (u,v)
+                                    mr = mr_by_id.get(next_tid)
+                                    hold_xyz_m = None
+                                    if mr is not None and ("X" in mr):
+                                        # matched_results의 X는 mm 기준 ndarray/tuple
+                                        X_mm = np.array(mr["X"], dtype=np.float64)
+                                        hold_xyz_m = (X_mm / 1000.0).astype(np.float64)  # (m)
+
+                                    # 3) 머리 3D 복원 (깊이에서 median 뽑아 역투영)
+                                    head_xyz_m = None
+                                    if head_xy_px is not None:
+                                        depth_m_full = cap.get_depth_meters()
+                                        hx, hy = int(round(head_xy_px[0])), int(round(head_xy_px[1]))
+                                        Z_head = depth_median_at(depth_m_full, hx, hy, r=3)  # (m)
+                                        if Z_head and Z_head > 0:
+                                            head_xyz_m = cap.deproject(hx, hy, Z_head)  # (m) float3
+
+                                    # 4) 가중 보정 각 계산 + 전송
+                                    if (head_xyz_m is not None) and (hold_xyz_m is not None):
+                                        # 목표까지 실제 거리 R(m). (레이저/카메라 오프셋 무시해도 소각에서는 충분)
+                                        R_m = float(np.linalg.norm(hold_xyz_m))
+
+                                        p3 = HeadViewBias3DParams()
+
+                                        dyaw_w, dpitch_w, info = compute_bias_angles_3d(
+                                            head_xyz_m, hold_xyz_m, hold_range_m=R_m,
+                                            head_xy_px=head_xy_px, hold_xy_px=hold_xy_px,
+                                            params=p3
+                                        )
+
+                                        # 화살표를 3초간 유지하도록 만료 타임스탬프 갱신 (freeze 모드)
+                                        if head_xy_px is not None and hold_xy_px is not None:
+                                            arrow_src_px = head_xy_px      # 사람(머리) → 홀드
+                                            arrow_dst_px = hold_xy_px
+                                            arrow_expire_ts = time.time() + ARROW_STICKY_SEC
+
+                                        # [추가] 머리/홀드의 픽셀 및 3D 좌표 + 두 점 사이 거리 로그
+                                        print(f"[Head/Hold px] head={head_xy_px}  hold={hold_xy_px}")
+                                        hx, hy, hz = map(float, head_xyz_m)
+                                        tx, ty, tz = map(float, hold_xyz_m)
+                                        print(f"[Head/Hold 3D] head=({hx:.3f},{hy:.3f},{hz:.3f}) m  "
+                                            f"hold=({tx:.3f},{ty:.3f},{tz:.3f}) m  "
+                                            f"d_head_hold={info['dist_m']:.3f} m")
+
+                                        # world→서보 각으로 변환해 2차 전송  ※ 1차와 동일 경로 사용
+                                        # (권장) 2차 전용 게인 — 너무 미세하면 살짝 키우세요
+                                        dyaw_w   *= K_2ND_YAW_GAIN
+                                        dpitch_w *= K_2ND_PITCH_GAIN
+
+                                        # 1) 기준 월드 각도(1차에서 이미 구한 값) 꺼내기
+                                        yaw_hold   = mr["yaw_deg"]     # world
+                                        pitch_hold = mr["pitch_deg"]   # world
+
+                                        # 2) 월드 공간에서 델타 적용 → 절대 목표 월드 각도
+                                        yaw_hold2   = yaw_hold   + dyaw_w
+                                        pitch_hold2 = pitch_hold + dpitch_w
+
+                                        # 3) 1차와 '완전히' 같은 변환 경로로 서보 각 산출
+                                        ty2, tp2 = servo_cmd_from_laser_ref(yaw_hold2, pitch_hold2, yaw_laser0, pitch_laser0)
+
+                                        # (선택) 모터 해상도에 맞춰 양자화 + 최소 변화 임계
+                                        def _quantize(x, step): return round(x/step)*step
+                                        SERVO_QUANT_STEP_DEG = globals().get("SERVO_QUANT_STEP_DEG", 0.1)  # 정수만이면 1.0
+                                        SERVO_MIN_DELTA_DEG  = globals().get("SERVO_MIN_DELTA_DEG", 0.2)
+
+                                        ty2_q   = _quantize(ty2,   SERVO_QUANT_STEP_DEG)
+                                        tp2_q   = _quantize(tp2,   SERVO_QUANT_STEP_DEG)
+
+                                        time.sleep(0.5)  # 1차 이동 안정화 대기
+
+                                        if (abs(ty2_q - target_yaw) >= SERVO_MIN_DELTA_DEG) or (abs(tp2_q - target_pitch) >= SERVO_MIN_DELTA_DEG):
+                                            send_servo_angles(ctl, ty2_q, tp2_q)
+                                            print(f"[HeadBias3D] sector={info['sector']} d3={info['dist_m']:.2f}m R={R_m:.2f}m "
+                                                f"θmax={info['theta_max_deg']:.2f}° w={info['weight']:.2f}  "
+                                                f"Δyaw={dyaw_w:+.3f}° Δpitch={dpitch_w:+.3f}°  "
+                                                f"servo:{target_yaw:.2f},{target_pitch:.2f} → {ty2_q:.2f},{tp2_q:.2f}")
+                                    # ===== 보정 끝 =====
+                                    '''
+                                    if route_pos + 1 >= START_OCCLUSION_AT:
+                                        occlusion_active = True   # 다섯번째부터 ON
                                     route_pos += 1
                                     current_target_id   = next_tid
                                     current_target_part = next_part
@@ -796,6 +993,19 @@ def _run_frame_loop(cap, size, holds, matched_results,
                         (10, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
             cv2.putText(vis, f"FPS: {fps:.1f} (Auto={'ON' if auto_advance_enabled else 'OFF'})",
                         (10, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 1, cv2.LINE_AA)
+
+
+            # === 사람 머리 <-----> 다음 타켓 홀드와의 방향성 선 그려주기 ===
+            # now = time.time()
+            # if (now < arrow_expire_ts) and arrow_src_px and arrow_dst_px:
+            #     ax, ay = int(arrow_src_px[0]), int(arrow_src_px[1])
+            #     bx, by = int(arrow_dst_px[0]), int(arrow_dst_px[1])
+            #     cv2.arrowedLine(vis, (ax, ay), (bx, by), (0, 0, 255), 3, cv2.LINE_AA, tipLength=0.22)  # 사람→홀드(빨강)
+            #     cv2.arrowedLine(vis, (bx, by), (ax, ay), (255, 0, 0), 3, cv2.LINE_AA, tipLength=0.22)  # 홀드→사람(파랑)
+            #     # (선택) 라벨
+            #     cv2.putText(vis, "H->T", (ax+8, ay-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2, cv2.LINE_AA)
+            #     cv2.putText(vis, "T->H", (bx+8, by-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 2, cv2.LINE_AA)
+            # ===============================================
 
             cv2.imshow(WINDOW_NAME, vis)
             if SAVE_VIDEO:
@@ -853,9 +1063,8 @@ def main():
         print("[Select] 선택 없음"); return
 
     holds = [holds[i] for i in idx]
-    # holds = assign_indices_row_major(holds, row_tol=ROW_TOL_Y)
-    for new_id, h in enumerate(holds):
-        h["hold_index"] = new_id
+    holds = assign_indices(holds, row_tol=ROW_TOL_Y)
+
     for h in holds:
         if "mask" not in h:
             h["mask"] = _mask_from_contour((proc_size[1], proc_size[0]), h["contour"])

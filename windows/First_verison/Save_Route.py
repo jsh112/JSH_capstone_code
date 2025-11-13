@@ -26,7 +26,7 @@ from click_select import interactive_select_live_left_only
 # === RealSense 어댑터(컬러만 사용, depth는 무시) ===
 from realsense_adapter import RealSenseColorDepth
 
-# _HAS_ASSIGN 삭제
+# === 홀드 유틸 ===
 from hold_utils import initial_5frames_all_classes, assign_indices
 
 # ========= 사용자 경로 =========
@@ -35,7 +35,7 @@ MODEL_PATH     = r"C:\Users\jshkr\OneDrive\문서\JSH_CAPSTONE_CODE\windows\para
 # ========= 런타임 파라미터 =========
 WINDOW_NAME    = "SaveRoute (D455 color only)"
 THRESH_MASK    = 0.7
-ROW_TOL_Y      = 30
+ROW_TOL_Y      = 1
 SELECTED_COLOR = None    # 예) "orange" (None=전체). ← 파일명 라벨만!
 
 # 터치 판정(프레임 기반)
@@ -104,33 +104,6 @@ def build_foot_masks_sided(coords, shape_hw):
         r = max(FOOT_MIN_R_PX, int(round(FOOT_R_SCALE * L)))
         _draw_capsule(masks["right_foot"], A, B, r)
     return masks
-
-# ========== 로컬 폴백: 행(y)→열(x) 정렬로 ID 부여 ==========
-def _assign_indices_row_major_local(holds, row_tol=30):
-    if not holds: return []
-    # y기반 행 클러스터링
-    rows = []
-    for i, h in enumerate(holds):
-        cy = h["center"][1]
-        assigned = False
-        for row in rows:
-            if abs(cy - row["y"]) <= row_tol:
-                row["idxs"].append(i)
-                row["y"] = int(round(np.mean([holds[j]["center"][1] for j in row["idxs"]])))
-                assigned = True
-                break
-        if not assigned:
-            rows.append({"y": int(cy), "idxs": [i]})
-    rows.sort(key=lambda r: r["y"])
-    ordered = []
-    hid = 0
-    for row in rows:
-        idxs_sorted = sorted(row["idxs"], key=lambda i: holds[i]["center"][0])
-        for i in idxs_sorted:
-            holds[i]["hold_index"] = hid
-            ordered.append(holds[i])
-            hid += 1
-    return ordered
 
 def main():
     ap = argparse.ArgumentParser()
