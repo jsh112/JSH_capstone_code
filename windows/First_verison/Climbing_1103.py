@@ -530,6 +530,13 @@ def _run_frame_loop(cap, size, holds, matched_results,
                 cv2.drawContours(vis, [h["contour"]], -1, h["color"], 1)  # 얇게
 
                 # [ADD] 홀드 바운딩박스(노란색 / 타깃은 주황색). 25.10.31 - 1
+                """
+                cv.boundingRect(array) -> retval
+                return:
+                x, y, w, h
+                x, y -> the top-left coordinate of the rectangle
+                w, h -> its width and height
+                """
                 bx, by, bw, bh = cv2.boundingRect(np.asarray(h["contour"], dtype=np.int32))
                 color = (0, 255, 255) if h["hold_index"] != current_target_id else (0, 165, 255)
                 thick = 2 if h["hold_index"] != current_target_id else 3
